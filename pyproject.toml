@@ -21,6 +21,10 @@ pybullet = "^3.2.5"
 gymnasium = "~=1.2"
 stable-baselines3 = "^2.0.0"
 control = "^0.10.2"
+wandb = "^0.23.0"
+tensorboard = "^2.20.0"
+opencv = "^4.10.0"
+
 
 [tool.poetry.dev-dependencies]
 

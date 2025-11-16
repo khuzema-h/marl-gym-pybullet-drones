@@ -22,6 +22,8 @@ class Logger(object):
                  num_drones: int=1,
                  duration_sec: int=0,
                  colab: bool=False,
+                 use_wandb: bool=False,
+                 wandb_run=None
                  ):
         """Logger class __init__ method.
 
@@ -36,6 +38,10 @@ class Logger(object):
             Number of drones.
         duration_sec : int, optional
             Used to preallocate the log arrays (improves performance).
+        use_wandb : bool, optional
+            Whether to log to Weights & Biases.
+        wandb_run : wandb.Run, optional
+            Weights & Biases run object.
 
         """
         self.COLAB = colab
@@ -47,6 +53,12 @@ class Logger(object):
         self.PREALLOCATED_ARRAYS = False if duration_sec == 0 else True
         self.counters = np.zeros(num_drones)
         self.timestamps = np.zeros((num_drones, duration_sec*self.LOGGING_FREQ_HZ))
+        
+        # WandB configuration
+        self.use_wandb = use_wandb
+        self.wandb_run = wandb_run
+        self.wandb_data = {}  # Store data for WandB logging
+        
         #### Note: this is the suggest information to log ##############################
         self.states = np.zeros((num_drones, 16, duration_sec*self.LOGGING_FREQ_HZ)) #### 16 states: pos_x,
                                                                                                   # pos_y,
@@ -117,6 +129,40 @@ class Logger(object):
         self.states[drone, :, current_counter] = np.hstack([state[0:3], state[10:13], state[7:10], state[13:20]])
         self.controls[drone, :, current_counter] = control
         self.counters[drone] = current_counter + 1
+
+        # Log to WandB if enabled
+        if self.use_wandb and self.wandb_run is not None:
+            # Store data for periodic WandB logging
+            step_key = f"step_{int(timestamp * self.LOGGING_FREQ_HZ)}"
+            if step_key not in self.wandb_data:
+                self.wandb_data[step_key] = {}
+            
+            self.wandb_data[step_key].update({
+                f"drone_{drone}/position_x": state[0],
+                f"drone_{drone}/position_y": state[1],
+                f"drone_{drone}/position_z": state[2],
+                f"drone_{drone}/velocity_x": state[10],
+                f"drone_{drone}/velocity_y": state[11],
+                f"drone_{drone}/velocity_z": state[12],
+                f"drone_{drone}/roll": state[7],
+                f"drone_{drone}/pitch": state[8],
+                f"drone_{drone}/yaw": state[9],
+                f"drone_{drone}/rpm_0": state[13],
+                f"drone_{drone}/rpm_1": state[14],
+                f"drone_{drone}/rpm_2": state[15],
+                f"drone_{drone}/rpm_3": state[16],
+            })
+
+    ################################################################################
+
+    def flush_wandb(self):
+        """Flush accumulated data to WandB."""
+        if self.use_wandb and self.wandb_run is not None and self.wandb_data:
+            # Log all accumulated data
+            for step_key, step_data in self.wandb_data.items():
+                self.wandb_run.log(step_data)
+            # Clear accumulated data
+            self.wandb_data = {}
 
     ################################################################################
 
@@ -211,11 +257,21 @@ class Logger(object):
             If True, converts logged RPM into PWM values (for Crazyflies).
 
         """
+        # Create plot and log to WandB if enabled
+        if self.use_wandb and self.wandb_run is not None:
+            # We'll create the plot and log it to WandB
+            self._create_and_log_plots(pwm)
+        else:
+            self._create_plots(pwm)
+
+    def _create_plots(self, pwm=False):
+        """Create plots locally."""
         #### Loop over colors and line styles ######################
         plt.rc('axes', prop_cycle=(cycler('color', ['r', 'g', 'b', 'y']) + cycler('linestyle', ['-', '--', ':', '-.'])))
-        fig, axs = plt.subplots(10, 2)
+        fig, axs = plt.subplots(10, 2, figsize=(15, 20))
         t = np.arange(0, self.timestamps.shape[1]/self.LOGGING_FREQ_HZ, 1/self.LOGGING_FREQ_HZ)
 
+        # [Rest of the original plot method remains the same...]
         #### Column ################################################
         col = 0
 
@@ -377,3 +433,12 @@ class Logger(object):
             plt.savefig(os.path.join('results', 'output_figure.png'))
         else:
             plt.show()
+
+    def _create_and_log_plots(self, pwm=False):
+        """Create plots and log them to WandB."""
+        self._create_plots(pwm)
+        
+        if self.use_wandb and self.wandb_run is not None:
+            # Log the figure to WandB
+            self.wandb_run.log({"drone_trajectories": plt})
+            plt.close()  # Close the figure after logging
