@@ -180,10 +180,10 @@ class PPO(BaseController):
             print("tqdm not available, continuing without progress bar...")
 
         # Print training header
-        print(f"\n🎯 Starting PPO Training")
-        print(f"📈 Target: {self.max_env_steps} total steps")
-        print(f"📊 Logging every {self.log_interval} steps")
-        print(f"⭐ Evaluating every {self.eval_interval} steps")
+        print(f"\nStarting PPO Training")
+        print(f"Target: {self.max_env_steps} total steps")
+        print(f"Logging every {self.log_interval} steps")
+        print(f"Evaluating every {self.eval_interval} steps")
         print(f"\n{'Step':>8} {'Return':>12} {'Length':>8} {'Value Loss':>12} {'Policy Loss':>12} {'Entropy':>10}")
         print("-" * 80)
 

@@ -119,7 +119,7 @@ class PPOBuffer(object):
         self.t = (self.t + 1) % self.max_length
 
     def get(self,
-            device='cpu'
+            device='cuda'
             ):
         '''Returns all data.'''
         batch = {}
@@ -141,7 +141,7 @@ class PPOBuffer(object):
 
     def sampler(self,
                 mini_batch_size,
-                device='cpu',
+                device='cuda',
                 drop_last=True
                 ):
         '''Makes sampler to loop through all data.'''

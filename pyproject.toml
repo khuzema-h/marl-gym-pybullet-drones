@@ -24,6 +24,7 @@ control = "^0.10.2"
 wandb = "^0.23.0"
 tensorboard = "^2.20.0"
 opencv-python = "^4.10.0"
+munch = "^4.0.0"
 
 
 [tool.poetry.dev-dependencies]

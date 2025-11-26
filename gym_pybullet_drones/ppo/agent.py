@@ -343,7 +343,7 @@ class PPOAgent:
 
     def update(self,
                rollouts,
-               device='cpu'
+               device='cuda'
                ):
         '''Updates model parameters based on current training batch.'''
         results = defaultdict(list)
