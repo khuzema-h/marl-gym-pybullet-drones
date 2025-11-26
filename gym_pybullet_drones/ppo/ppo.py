@@ -166,16 +166,74 @@ class PPO(BaseController):
         return action
 
     def learn(self,
-              env=None,
-              **kwargs
-              ):
+          env=None,
+          **kwargs
+          ):
         '''Performs learning (pre-training, training, fine-tuning, etc).'''
+
+        # Import tqdm for progress bar
+        try:
+            from tqdm import tqdm
+            TQDM_AVAILABLE = True
+        except ImportError:
+            TQDM_AVAILABLE = False
+            print("tqdm not available, continuing without progress bar...")
+
+        # Print training header
+        print(f"\n🎯 Starting PPO Training")
+        print(f"📈 Target: {self.max_env_steps} total steps")
+        print(f"📊 Logging every {self.log_interval} steps")
+        print(f"⭐ Evaluating every {self.eval_interval} steps")
+        print(f"\n{'Step':>8} {'Return':>12} {'Length':>8} {'Value Loss':>12} {'Policy Loss':>12} {'Entropy':>10}")
+        print("-" * 80)
+
+        # Initialize progress bar
+        if TQDM_AVAILABLE:
+            pbar = tqdm(total=self.max_env_steps, initial=self.total_steps, desc="Training", 
+                    bar_format='{l_bar}{bar:20}{r_bar}{bar:-20b}')
+        else:
+            print(f"Progress: {self.total_steps}/{self.max_env_steps}")
 
         if self.num_checkpoints > 0:
             step_interval = np.linspace(0, self.max_env_steps, self.num_checkpoints)
             interval_save = np.zeros_like(step_interval, dtype=bool)
+            
+        # Training loop
         while self.total_steps < self.max_env_steps:
             results = self.train_step()
+            
+            # Update progress bar
+            if TQDM_AVAILABLE:
+                pbar.update(self.rollout_steps)
+                # Update progress bar description with current stats
+                if self.total_steps % self.log_interval == 0:
+                    ep_returns = np.asarray(self.env.return_queue)
+                    if len(ep_returns) > 0:
+                        mean_return = ep_returns.mean()
+                        pbar.set_description(f"Training (Return: {mean_return:.1f})")
+
+            # === LIVE TERMINAL LOGGING ===
+            if self.total_steps % self.log_interval == 0:
+                # Get current stats
+                ep_returns = np.asarray(self.env.return_queue)
+                ep_lengths = np.asarray(self.env.length_queue)
+                
+                if len(ep_returns) > 0:
+                    mean_return = ep_returns.mean()
+                    mean_length = ep_lengths.mean()
+                else:
+                    mean_return = 0
+                    mean_length = 0
+                    
+                # Get loss values
+                policy_loss = results.get('policy_loss', 0)
+                value_loss = results.get('value_loss', 0)
+                entropy_loss = results.get('entropy_loss', 0)
+                
+                # Print to terminal
+                print(f"{self.total_steps:8d} {mean_return:12.2f} {mean_length:8.1f} "
+                    f"{value_loss:12.4f} {policy_loss:12.4f} {entropy_loss:10.4f}")
+
             # Checkpoint.
             if self.total_steps >= self.max_env_steps or (self.save_interval and self.total_steps % self.save_interval == 0):
                 # Latest/final checkpoint.
@@ -183,6 +241,9 @@ class PPO(BaseController):
                 self.logger.info(f'Checkpoint | {self.checkpoint_path}')
                 path = os.path.join(self.output_dir, 'checkpoints', 'model_{}.pt'.format(self.total_steps))
                 self.save(path)
+                if self.total_steps % self.log_interval == 0:
+                    print(f"💾 Checkpoint saved at step {self.total_steps}")
+                    
             if self.num_checkpoints > 0:
                 interval_id = np.argmin(np.abs(np.array(step_interval) - self.total_steps))
                 if interval_save[interval_id] is False:
@@ -190,23 +251,63 @@ class PPO(BaseController):
                     path = os.path.join(self.output_dir, 'checkpoints', f'model_{self.total_steps}.pt')
                     self.save(path)
                     interval_save[interval_id] = True
+                    
             # Evaluation.
             if self.eval_interval and self.total_steps % self.eval_interval == 0:
                 eval_results = self.run(env=self.eval_env, n_episodes=self.eval_batch_size)
                 results['eval'] = eval_results
-                self.logger.info('Eval | ep_lengths {:.2f} +/- {:.2f} | ep_return {:.3f} +/- {:.3f}'.format(eval_results['ep_lengths'].mean(),
-                                                                                                            eval_results['ep_lengths'].std(),
-                                                                                                            eval_results['ep_returns'].mean(),
-                                                                                                            eval_results['ep_returns'].std()))
+                
+                # Print evaluation results to terminal
+                eval_return = eval_results['ep_returns'].mean()
+                eval_std = eval_results['ep_returns'].std()
+                eval_length = eval_results['ep_lengths'].mean()
+                
+                print(f"⭐ [EVAL] Step {self.total_steps}: Return {eval_return:.2f} +/- {eval_std:.2f}, Length: {eval_length:.1f}")
+                
+                # Color code evaluation results based on performance
+                if eval_return > 0:
+                    print(f"🎉 Good progress! Average return: {eval_return:.2f}")
+                elif eval_return > -100:
+                    print(f"📊 Learning... Average return: {eval_return:.2f}")
+                else:
+                    print(f"🔄 Needs improvement... Average return: {eval_return:.2f}")
+                
+                self.logger.info('Eval | ep_lengths {:.2f} +/- {:.2f} | ep_return {:.3f} +/- {:.3f}'.format(
+                    eval_results['ep_lengths'].mean(),
+                    eval_results['ep_lengths'].std(),
+                    eval_results['ep_returns'].mean(), 
+                    eval_results['ep_returns'].std()))
+                    
                 # Save best model.
                 eval_score = eval_results['ep_returns'].mean()
                 eval_best_score = getattr(self, 'eval_best_score', -np.inf)
                 if self.eval_save_best and eval_best_score < eval_score:
                     self.eval_best_score = eval_score
                     self.save(os.path.join(self.output_dir, 'model_best.pt'))
-            # Logging.
+                    print(f"🏆 New best model! Score: {eval_score:.2f} (saved)")
+                    
+            # Logging to files/tensorboard.
             if self.log_interval and self.total_steps % self.log_interval == 0:
                 self.log_step(results)
+
+        # Training completed
+        if TQDM_AVAILABLE:
+            pbar.close()
+        
+        print("✅ Training completed successfully!")
+        print(f"📁 Final model saved to: {self.checkpoint_path}")
+        
+        # Final evaluation
+        print("\n🔍 Running final evaluation...")
+        final_eval = self.run(env=self.eval_env, n_episodes=10)
+        final_return = final_eval['ep_returns'].mean()
+        final_std = final_eval['ep_returns'].std()
+        print(f"🎯 Final Evaluation: Return {final_return:.2f} +/- {final_std:.2f}")
+        
+        # Save final model
+        final_path = os.path.join(self.output_dir, 'model_final.pt')
+        self.save(final_path)
+        print(f"💾 Final model saved to: {final_path}")
 
     def run(self,
             env=None,
@@ -312,22 +413,37 @@ class PPO(BaseController):
 
             # Fix shapes for multi-agent
             # For multi-agent with 2 drones, we need to expand rew and mask to match
+            num_drones = obs.shape[0] if len(obs.shape) > 1 else 1
+
+            # Fix shapes for multi-agent
+            # For multi-agent, we need to expand rew and mask to match number of drones
             if rew.shape == (1,):
-                rew = np.full((2, 1), rew[0])  # Expand to (2, 1) - one reward per drone
+                rew = np.full((num_drones, 1), rew[0])  # Expand to (num_drones, 1) - one reward per drone
+            elif rew.shape == (2, 1):  # This was hardcoded for 2 drones, need to handle dynamically
+                if num_drones != 2:
+                    # Reshape to match current number of drones
+                    rew = np.full((num_drones, 1), rew[0, 0])  # Use first reward value for all drones
+
             if mask.shape == (1,):
-                mask = np.full((2, 1), mask[0])  # Expand to (2, 1) - one mask per drone
+                mask = np.full((num_drones, 1), mask[0])  # Expand to (num_drones, 1) - one mask per drone
+            elif mask.shape == (2, 1):  # This was hardcoded for 2 drones, need to handle dynamically
+                if num_drones != 2:
+                    # Reshape to match current number of drones
+                    mask = np.full((num_drones, 1), mask[0, 0])  # Use first mask value for all drones
 
             # Remove extra dimension from v and logp if needed
-            if v.shape == (2, 1, 1):
-                v = v.reshape(2, 1)  # Reshape to (2, 1)
-            if logp.shape == (2, 1, 1):
-                logp = logp.reshape(2, 1)  # Reshape to (2, 1)
+            if v.ndim == 3 and v.shape[-1] == 1:  # Shape like (num_drones, 1, 1)
+                v = v.reshape(num_drones, 1)  # Reshape to (num_drones, 1)
+            if logp.ndim == 3 and logp.shape[-1] == 1:  # Shape like (num_drones, 1, 1)
+                logp = logp.reshape(num_drones, 1)  # Reshape to (num_drones, 1)
 
             # Also ensure terminal_v has the right shape
             if terminal_v.shape == ():
                 terminal_v = np.zeros_like(v)
+            elif terminal_v.ndim == 3 and terminal_v.shape[-1] == 1:  # Shape like (num_drones, 1, 1)
+                terminal_v = terminal_v.reshape(num_drones, 1)  # Reshape to (num_drones, 1)
 
-            #print(f"[DEBUG] Shapes after fix - obs: {obs.shape}, act: {act.shape}, rew: {rew.shape}, mask: {mask.shape}, v: {v.shape}, logp: {logp.shape}")
+            #print(f"[DEBUG] Shapes after fix - obs: {obs.shape}, act: {act.shape}, rew: {rew.shape}, mask: {mask.shape}, v: {v.shape}, logp: {logp.shape}, num_drones: {num_drones}")
 
             rollouts.push({'obs': obs, 'act': act, 'rew': rew, 'mask': mask, 'v': v, 'logp': logp, 'terminal_v': terminal_v})
             obs = next_obs
@@ -365,11 +481,48 @@ class PPO(BaseController):
         results.update({'step': self.total_steps, 'elapsed_time': time.time() - start})
         return results
 
-    def log_step(self,
-                 results
-                 ):
+    def log_step(self, results):
         '''Does logging after a training step.'''
         step = results['step']
+        
+        # === ADD LIVE TERMINAL LOGGING ===
+        if step % self.log_interval == 0:
+            # Get current stats
+            ep_lengths = np.asarray(self.env.length_queue)
+            ep_returns = np.asarray(self.env.return_queue)
+            
+            # Print training progress to terminal
+            if len(ep_returns) > 0:
+                mean_return = ep_returns.mean()
+                mean_length = ep_lengths.mean()
+            else:
+                mean_return = 0
+                mean_length = 0
+                
+            # Get loss values (with defaults if not available)
+            policy_loss = results.get('policy_loss', 0)
+            value_loss = results.get('value_loss', 0) 
+            entropy_loss = results.get('entropy_loss', 0)
+            approx_kl = results.get('approx_kl', 0)
+            
+            # Print header on first log
+            if step == self.log_interval:
+                print(f"\n{'Step':>8} {'Return':>12} {'Length':>8} {'Value Loss':>12} {'Policy Loss':>12} {'Entropy':>10} {'KL':>8}")
+                print("-" * 80)
+            
+            # Print current progress
+            print(f"{step:8d} {mean_return:12.2f} {mean_length:8.1f} "
+                f"{value_loss:12.4f} {policy_loss:12.4f} {entropy_loss:10.4f} {approx_kl:8.4f}")
+            
+            # Also print evaluation results if available
+            if 'eval' in results:
+                eval_returns = results['eval']['ep_returns']
+                eval_lengths = results['eval']['ep_lengths']
+                print(f"{'EVAL':>8} {eval_returns.mean():12.2f} {eval_lengths.mean():8.1f} "
+                    f"{'':>12} {'':>12} {'':>10} {'':>8}")
+        # === END LIVE TERMINAL LOGGING ===
+        
+        # Original logging code (keep this)
         # runner stats
         self.logger.add_scalars(
             {
