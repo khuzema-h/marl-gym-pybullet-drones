@@ -245,7 +245,7 @@ def run(multiagent=DEFAULT_MA,
         if DEFAULT_OBS == ObservationType.KIN:
             if not multiagent:
                 logger.log(drone=0,
-                    timestamp=iFalse/test_env.CTRL_FREQ,
+                    timestamp=False/test_env.CTRL_FREQ,
                     state=np.hstack([obs2[0:3],
                                         np.zeros(4),
                                         obs2[3:15],
