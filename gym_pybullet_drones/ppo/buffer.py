@@ -24,29 +24,27 @@ class PPOBuffer(object):
         
         #print(f"[DEBUG] Buffer - obs_shape: {obs_shape}, act_shape: {act_shape}, T: {T}, N: {N}")
         
-        # Handle multi-agent vs single-agent shapes
+        # Detect single vs multi-agent
+        # Single-agent: (obs_dim,) or (1, obs_dim)  
+        # Multi-agent: (num_agents, obs_dim) where num_agents > 1
         if len(obs_shape) == 1:
             # Single agent: (obs_dim,)
-            obs_vshape = (T, N, obs_shape[0])
-            num_agents = 1
-        else:
-            # Multi-agent: (num_agents, obs_dim)
-            obs_vshape = (T, N, *obs_shape)
-            num_agents = obs_shape[0]
-        
-        if len(act_shape) == 1:
-            # Single agent: (act_dim,)
-            act_vshape = (T, N, act_shape[0])
-        else:
-            # Multi-agent: (num_agents, act_dim)
-            act_vshape = (T, N, *act_shape)
-        
-        # For multi-agent, scalar values (v, logp, rew, mask) should have shape (num_agents, 1)
-        # For single-agent, they should have shape (1,)
-        if num_agents > 1:
-            scalar_vshape = (T, N, num_agents, 1)
-        else:
+            obs_vshape = (T, N, obs_shape[0])  # (T, N, obs_dim)
+            act_vshape = (T, N, act_shape[0])  # (T, N, act_dim)
             scalar_vshape = (T, N, 1)
+        elif len(obs_shape) == 2 and obs_shape[0] == 1:
+            # Single agent but shaped as (1, obs_dim) - common case
+            obs_vshape = (T, N, obs_shape[1])  # (T, N, obs_dim)  
+            act_vshape = (T, N, act_shape[1]) if len(act_shape) == 2 else (T, N, act_shape[0])
+            scalar_vshape = (T, N, 1)
+        else:
+            # Multi-agent: (num_agents, obs_dim) where num_agents > 1
+            obs_vshape = (T, N, *obs_shape)    # (T, N, num_agents, obs_dim)
+            act_vshape = (T, N, *act_shape)    # (T, N, num_agents, act_dim)
+            num_agents = obs_shape[0]
+            scalar_vshape = (T, N, num_agents, 1)
+        
+        #print(f"[DEBUG] Buffer schemes - obs_vshape: {obs_vshape}, act_vshape: {act_vshape}, scalar_vshape: {scalar_vshape}")
         
         self.scheme = {
             'obs': {
@@ -80,6 +78,7 @@ class PPOBuffer(object):
         }
         self.keys = list(self.scheme.keys())
         self.reset()
+
     def reset(self):
         '''Allocates space for containers.'''
         for k, info in self.scheme.items():
@@ -104,15 +103,22 @@ class PPOBuffer(object):
             
             v_ = np.asarray(deepcopy(v), dtype=dtype)
             
-            # Ensure the shape matches by adding batch dimension if needed
-            if v_.ndim == len(shape) - 1:
-                v_ = v_[np.newaxis, ...]  # Add batch dimension
+            # Special handling for observations - they have different dimensions than scalars
+            if k == 'obs':
+                # For observations, we need to handle the actual observation dimension
+                if v_.ndim == len(shape) - 1:
+                    v_ = v_[np.newaxis, ...]  # Add batch dimension if needed
+            else:
+                # For scalar values (rew, mask, v, logp, etc.)
+                if v_.ndim == len(shape) - 1:
+                    v_ = v_[np.newaxis, ...]  # Add batch dimension if needed
             
             # Reshape to target shape
             try:
                 v_ = v_.reshape(shape)
             except ValueError as e:
                 print(f"[ERROR] Buffer.push - Cannot reshape {k} from {v_.shape} to {shape}")
+                print(f"[ERROR] Data sample: {v_[:2] if v_.size > 2 else v_}")
                 raise e
                 
             self.__dict__[k][self.t] = v_
@@ -184,71 +190,135 @@ def compute_returns_and_advantages(rews,
     # print(f"[DEBUG] compute_returns - terminal_vals: {terminal_vals.shape if hasattr(terminal_vals, 'shape') else terminal_vals}")
     # print(f"[DEBUG] compute_returns - last_val: {last_val.shape if hasattr(last_val, 'shape') else last_val}")
     
-    # Get dimensions
-    T, N, num_agents, _ = rews.shape  # (T, N, num_agents, 1)
-    
-    # Initialize returns and advantages
-    rets = np.zeros((T, N, num_agents, 1))
-    advs = np.zeros((T, N, num_agents, 1))
-    
-    # Process each batch and agent separately
-    for batch_idx in range(N):
-        for agent_idx in range(num_agents):
-            # Extract data for this batch and agent
-            agent_rews = rews[:, batch_idx, agent_idx, 0]  # (T,)
-            agent_vals = vals[:, batch_idx, agent_idx, 0]  # (T,)
-            agent_masks = masks[:, batch_idx, agent_idx, 0]  # (T,)
+    # Handle both single-agent (3D) and multi-agent (4D) data
+    if rews.ndim == 4:
+        # Multi-agent: (T, N, num_agents, 1)
+        T, N, num_agents, _ = rews.shape
+        rets = np.zeros((T, N, num_agents, 1))
+        advs = np.zeros((T, N, num_agents, 1))
+        
+        # Process each batch and agent separately
+        for batch_idx in range(N):
+            for agent_idx in range(num_agents):
+                # Extract data for this batch and agent
+                agent_rews = rews[:, batch_idx, agent_idx, 0]  # (T,)
+                agent_vals = vals[:, batch_idx, agent_idx, 0]  # (T,)
+                agent_masks = masks[:, batch_idx, agent_idx, 0]  # (T,)
+                
+                # Handle terminal_vals
+                if np.isscalar(terminal_vals):
+                    agent_terminal_vals = terminal_vals
+                else:
+                    agent_terminal_vals = terminal_vals[:, batch_idx, agent_idx, 0] if terminal_vals.ndim == 4 else 0
+                
+                # Handle last_val - ensure it's scalar for this agent
+                if np.isscalar(last_val):
+                    agent_last_val = last_val
+                elif last_val.ndim == 2:  # (num_agents, 1)
+                    agent_last_val = last_val[agent_idx, 0]
+                elif last_val.ndim == 3:  # (N, num_agents, 1)
+                    agent_last_val = last_val[batch_idx, agent_idx, 0]
+                else:
+                    agent_last_val = 0
+                
+                # Compute returns and advantages for this agent
+                agent_ret = np.zeros(T)
+                agent_adv = np.zeros(T)
+                
+                # Extend values with last value
+                vals_extended = np.concatenate([agent_vals, [agent_last_val]])
+                
+                ret = agent_last_val
+                adv = 0
+                
+                # Compute backwards
+                for i in reversed(range(T)):
+                    # Adjust reward with terminal value if provided
+                    if np.isscalar(agent_terminal_vals):
+                        rew_adjusted = agent_rews[i] + gamma * agent_terminal_vals
+                    else:
+                        rew_adjusted = agent_rews[i] + gamma * (agent_terminal_vals[i] if i < len(agent_terminal_vals) else 0)
+                    
+                    ret = rew_adjusted + gamma * agent_masks[i] * ret
+                    
+                    if not use_gae:
+                        adv = ret - agent_vals[i]
+                    else:
+                        td_error = rew_adjusted + gamma * agent_masks[i] * vals_extended[i + 1] - agent_vals[i]
+                        adv = adv * gae_lambda * gamma * agent_masks[i] + td_error
+                    
+                    agent_ret[i] = ret
+                    agent_adv[i] = adv
+                
+                # Store results
+                rets[:, batch_idx, agent_idx, 0] = agent_ret
+                advs[:, batch_idx, agent_idx, 0] = agent_adv
+        
+        return rets, advs
+        
+    else:
+        # Single-agent: (T, N, 1)
+        T, N, _ = rews.shape
+        rets = np.zeros((T, N, 1))
+        advs = np.zeros((T, N, 1))
+        
+        # Process each batch separately
+        for batch_idx in range(N):
+            # Extract data for this batch
+            batch_rews = rews[:, batch_idx, 0]  # (T,)
+            batch_vals = vals[:, batch_idx, 0]  # (T,)
+            batch_masks = masks[:, batch_idx, 0]  # (T,)
             
             # Handle terminal_vals
             if np.isscalar(terminal_vals):
-                agent_terminal_vals = terminal_vals
+                batch_terminal_vals = terminal_vals
             else:
-                agent_terminal_vals = terminal_vals[:, batch_idx, agent_idx, 0] if terminal_vals.ndim == 4 else 0
+                batch_terminal_vals = terminal_vals[:, batch_idx, 0] if terminal_vals.ndim == 3 else 0
             
-            # Handle last_val - ensure it's scalar for this agent
+            # Handle last_val
             if np.isscalar(last_val):
-                agent_last_val = last_val
-            elif last_val.ndim == 2:  # (num_agents, 1)
-                agent_last_val = last_val[agent_idx, 0]
-            elif last_val.ndim == 3:  # (N, num_agents, 1)
-                agent_last_val = last_val[batch_idx, agent_idx, 0]
+                batch_last_val = last_val
+            elif last_val.ndim == 1:  # (1,)
+                batch_last_val = last_val[0]
+            elif last_val.ndim == 2:  # (N, 1)
+                batch_last_val = last_val[batch_idx, 0]
             else:
-                agent_last_val = 0
+                batch_last_val = 0
             
-            # Compute returns and advantages for this agent
-            agent_ret = np.zeros(T)
-            agent_adv = np.zeros(T)
+            # Compute returns and advantages for this batch
+            batch_ret = np.zeros(T)
+            batch_adv = np.zeros(T)
             
             # Extend values with last value
-            vals_extended = np.concatenate([agent_vals, [agent_last_val]])
+            vals_extended = np.concatenate([batch_vals, [batch_last_val]])
             
-            ret = agent_last_val
+            ret = batch_last_val
             adv = 0
             
             # Compute backwards
             for i in reversed(range(T)):
                 # Adjust reward with terminal value if provided
-                if np.isscalar(agent_terminal_vals):
-                    rew_adjusted = agent_rews[i] + gamma * agent_terminal_vals
+                if np.isscalar(batch_terminal_vals):
+                    rew_adjusted = batch_rews[i] + gamma * batch_terminal_vals
                 else:
-                    rew_adjusted = agent_rews[i] + gamma * (agent_terminal_vals[i] if i < len(agent_terminal_vals) else 0)
+                    rew_adjusted = batch_rews[i] + gamma * (batch_terminal_vals[i] if i < len(batch_terminal_vals) else 0)
                 
-                ret = rew_adjusted + gamma * agent_masks[i] * ret
+                ret = rew_adjusted + gamma * batch_masks[i] * ret
                 
                 if not use_gae:
-                    adv = ret - agent_vals[i]
+                    adv = ret - batch_vals[i]
                 else:
-                    td_error = rew_adjusted + gamma * agent_masks[i] * vals_extended[i + 1] - agent_vals[i]
-                    adv = adv * gae_lambda * gamma * agent_masks[i] + td_error
+                    td_error = rew_adjusted + gamma * batch_masks[i] * vals_extended[i + 1] - batch_vals[i]
+                    adv = adv * gae_lambda * gamma * batch_masks[i] + td_error
                 
-                agent_ret[i] = ret
-                agent_adv[i] = adv
+                batch_ret[i] = ret
+                batch_adv[i] = adv
             
             # Store results
-            rets[:, batch_idx, agent_idx, 0] = agent_ret
-            advs[:, batch_idx, agent_idx, 0] = agent_adv
-    
-    return rets, advs
+            rets[:, batch_idx, 0] = batch_ret
+            advs[:, batch_idx, 0] = batch_adv
+        
+        return rets, advs
 
 
 def _compute_single_timestep_returns(rews, vals, masks, terminal_vals, last_val, gamma, use_gae, gae_lambda):

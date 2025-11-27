@@ -407,43 +407,74 @@ class PPO(BaseController):
                 terminal_val = self.agent.ac.critic(terminal_obs_tensor).squeeze().detach().cpu().numpy()
                 terminal_v = terminal_val
 
-            # Debug: check shapes before pushing to buffer
-            # Debug: check shapes before pushing to buffer
+                        # Debug: check shapes before pushing to buffer
             #print(f"[DEBUG] Shapes before push - obs: {obs.shape}, act: {act.shape}, rew: {rew.shape}, mask: {mask.shape}, v: {v.shape}, logp: {logp.shape}")
 
-            # Fix shapes for multi-agent
-            # For multi-agent with 2 drones, we need to expand rew and mask to match
-            num_drones = obs.shape[0] if len(obs.shape) > 1 else 1
+            # Detect if we're in multi-agent mode and get number of agents
+            is_multi_agent = len(obs.shape) > 1 and obs.shape[0] > 1
+            if is_multi_agent:
+                num_agents = obs.shape[0]
+            else:
+                num_agents = 1
 
-            # Fix shapes for multi-agent
-            # For multi-agent, we need to expand rew and mask to match number of drones
-            if rew.shape == (1,):
-                rew = np.full((num_drones, 1), rew[0])  # Expand to (num_drones, 1) - one reward per drone
-            elif rew.shape == (2, 1):  # This was hardcoded for 2 drones, need to handle dynamically
-                if num_drones != 2:
-                    # Reshape to match current number of drones
-                    rew = np.full((num_drones, 1), rew[0, 0])  # Use first reward value for all drones
+            # Fix shapes based on single vs multi-agent
+            if is_multi_agent:
+                # Multi-agent case
+                if rew.shape == (1,) or (rew.ndim == 1 and rew.shape[0] == 1):
+                    rew = np.full((num_agents, 1), rew[0])  # Expand to (num_agents, 1)
+                elif rew.ndim == 2 and rew.shape[0] != num_agents:
+                    # Reshape to match current number of agents
+                    rew = np.full((num_agents, 1), rew[0, 0] if rew.shape[0] > 0 else rew[0])
+                
+                if mask.shape == (1,) or (mask.ndim == 1 and mask.shape[0] == 1):
+                    mask = np.full((num_agents, 1), mask[0])  # Expand to (num_agents, 1)
+                elif mask.ndim == 2 and mask.shape[0] != num_agents:
+                    # Reshape to match current number of agents
+                    mask = np.full((num_agents, 1), mask[0, 0] if mask.shape[0] > 0 else mask[0])
+                
+                # Remove extra dimension from v and logp if needed
+                if v.ndim == 3 and v.shape[-1] == 1:
+                    v = v.reshape(num_agents, 1)
+                elif v.ndim == 2 and v.shape[0] != num_agents:
+                    v = np.full((num_agents, 1), v[0, 0] if v.shape[0] > 0 else v[0])
+                    
+                if logp.ndim == 3 and logp.shape[-1] == 1:
+                    logp = logp.reshape(num_agents, 1)
+                elif logp.ndim == 2 and logp.shape[0] != num_agents:
+                    logp = np.full((num_agents, 1), logp[0, 0] if logp.shape[0] > 0 else logp[0])
+                    
+            else:
+                # Single-agent case
+                if rew.shape == (1,) or (rew.ndim == 1 and rew.shape[0] == 1):
+                    rew = rew.reshape(1, 1)  # Shape: (1, 1)
+                elif rew.ndim == 2 and rew.shape[0] > 1:
+                    rew = rew[:1, :]  # Take first agent's reward
+                
+                if mask.shape == (1,) or (mask.ndim == 1 and mask.shape[0] == 1):
+                    mask = mask.reshape(1, 1)  # Shape: (1, 1)
+                elif mask.ndim == 2 and mask.shape[0] > 1:
+                    mask = mask[:1, :]  # Take first agent's mask
+                    
+                if v.ndim == 3 and v.shape[-1] == 1:
+                    v = v.reshape(1, 1)  # Shape: (1, 1)
+                elif v.ndim == 2 and v.shape[0] > 1:
+                    v = v[:1, :]  # Take first agent's value
+                    
+                if logp.ndim == 3 and logp.shape[-1] == 1:
+                    logp = logp.reshape(1, 1)  # Shape: (1, 1)
+                elif logp.ndim == 2 and logp.shape[0] > 1:
+                    logp = logp[:1, :]  # Take first agent's log probability
 
-            if mask.shape == (1,):
-                mask = np.full((num_drones, 1), mask[0])  # Expand to (num_drones, 1) - one mask per drone
-            elif mask.shape == (2, 1):  # This was hardcoded for 2 drones, need to handle dynamically
-                if num_drones != 2:
-                    # Reshape to match current number of drones
-                    mask = np.full((num_drones, 1), mask[0, 0])  # Use first mask value for all drones
-
-            # Remove extra dimension from v and logp if needed
-            if v.ndim == 3 and v.shape[-1] == 1:  # Shape like (num_drones, 1, 1)
-                v = v.reshape(num_drones, 1)  # Reshape to (num_drones, 1)
-            if logp.ndim == 3 and logp.shape[-1] == 1:  # Shape like (num_drones, 1, 1)
-                logp = logp.reshape(num_drones, 1)  # Reshape to (num_drones, 1)
-
-            # Also ensure terminal_v has the right shape
+            # Ensure terminal_v has the right shape
             if terminal_v.shape == ():
                 terminal_v = np.zeros_like(v)
-            elif terminal_v.ndim == 3 and terminal_v.shape[-1] == 1:  # Shape like (num_drones, 1, 1)
-                terminal_v = terminal_v.reshape(num_drones, 1)  # Reshape to (num_drones, 1)
+            elif terminal_v.ndim == 3 and terminal_v.shape[-1] == 1:
+                terminal_v = terminal_v.reshape(v.shape)
+            elif terminal_v.ndim == 2 and terminal_v.shape[0] != v.shape[0]:
+                terminal_v = np.zeros_like(v)
 
-            #print(f"[DEBUG] Shapes after fix - obs: {obs.shape}, act: {act.shape}, rew: {rew.shape}, mask: {mask.shape}, v: {v.shape}, logp: {logp.shape}, num_drones: {num_drones}")
+            #print(f"[DEBUG] Shapes after fix - obs: {obs.shape}, act: {act.shape}, rew: {rew.shape}, mask: {mask.shape}, v: {v.shape}, logp: {logp.shape}")
+            #print(f"[DEBUG] Mode: {'multi-agent' if is_multi_agent else 'single-agent'}, num_agents: {num_agents}")
 
             rollouts.push({'obs': obs, 'act': act, 'rew': rew, 'mask': mask, 'v': v, 'logp': logp, 'terminal_v': terminal_v})
             obs = next_obs

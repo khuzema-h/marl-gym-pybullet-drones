@@ -27,7 +27,7 @@ PPO_CONFIG = {
 
     # Runner args
     'max_env_steps': 1000000,
-    'num_workers': 1,
+    'num_workers': 16,
     'rollout_batch_size': 4,
     'rollout_steps': 100,
     'deque_size': 10,
