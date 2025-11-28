@@ -134,8 +134,8 @@ def run(multiagent=DEFAULT_MA,
         'hidden_dim': 64,
         'actor_lr': 0.0003,
         'critic_lr': 0.001,
-        'rollout_steps': 2048,
-        'rollout_batch_size': 1,  # Number of parallel environments
+        'rollout_steps': 512,
+        'rollout_batch_size': 8,  # Number of parallel environments
     })
 
     # Log configuration to WandB
