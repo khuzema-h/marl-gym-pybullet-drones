@@ -2,16 +2,17 @@ import torch
 import numpy as np
 from skrl.envs.wrappers.torch import wrap_env
 from gym_pybullet_drones.utils.enums import ObservationType, ActionType
-from gym_pybullet_drones.gym_pz.wrapper import PZMultiHoverAviary
+from gym_pybullet_drones.gym_pz.wrapper import PZMultiHover
 
 # 1. Setup the wrapped environment
-env_pz = PZMultiHoverAviary(
-    num_drones=2,
-    obs=ObservationType.KIN,
-    act=ActionType.RPM,
-    gui=True, 
-    record=False
-)
+env_pz = PZMultiHover(num_drones=5, 
+                      neighbourhood_radius=1.0, 
+                      pyb_freq=240, 
+                      ctrl_freq=240, 
+                      gui=True, 
+                      record=False, 
+                      obs=ObservationType.KIN, 
+                      act=ActionType.RPM)
 
 env_skrl = wrap_env(env_pz, wrapper="pettingzoo") 
 print(type(env_skrl))
