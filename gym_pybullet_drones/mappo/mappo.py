@@ -1,4 +1,4 @@
-'''Proximal Policy Optimization (PPO) main controller.'''
+'''Multi-Agent Proximal Policy Optimization (MAPPO) main controller.'''
 
 import os
 import time
@@ -15,12 +15,12 @@ from safe_control_gym.utils.logging import ExperimentLogger
 from safe_control_gym.utils.utils import get_random_state, is_wrapped, set_random_state
 
 from .agent import MAPPOAgent
-from .buffer import MAPPOBuffer, compute_returns_and_advantages
+from .buffer import MAPPOBuffer, compute_returns_and_advantages, normalize_advantages
 from .config import MAPPO_CONFIG
 
 
 class MAPPO(BaseController):
-    '''Proximal policy optimization.'''
+    '''Multi-Agent PPO with centralized training and decentralized execution.'''
 
     def __init__(self,
                  env_func,
@@ -30,7 +30,7 @@ class MAPPO(BaseController):
                  use_gpu=False,
                  seed=0,
                  **kwargs):
-        # Update with default config
+        # Update with default MAPPO config
         config = MAPPO_CONFIG.copy()
         config.update(kwargs)
         super().__init__(env_func, training, checkpoint_path, output_dir, use_gpu, seed, **config)
@@ -50,19 +50,51 @@ class MAPPO(BaseController):
         print(f"[DEBUG] Environment observation space: {self.env.observation_space}")
         print(f"[DEBUG] Environment action space: {self.env.action_space}")
         
-        # Agent.
-        self.agent = MAPPOAgent(self.env.observation_space,
-                              self.env.action_space,
-                              hidden_dim=self.hidden_dim,
-                              use_clipped_value=self.use_clipped_value,
-                              clip_param=self.clip_param,
-                              target_kl=self.target_kl,
-                              entropy_coef=self.entropy_coef,
-                              actor_lr=self.actor_lr,
-                              critic_lr=self.critic_lr,
-                              opt_epochs=self.opt_epochs,
-                              mini_batch_size=self.mini_batch_size,
-                              activation=self.activation)
+        # Parse observation space to determine if multi-agent
+        obs_shape = self.env.observation_space.shape
+        if len(obs_shape) == 1:
+            # Single agent or global state
+            self.num_agents = 1
+            self.obs_dim = obs_shape[0]
+        elif len(obs_shape) == 2:
+            # Multi-agent: (num_agents, obs_dim)
+            self.num_agents = obs_shape[0]
+            self.obs_dim = obs_shape[1]
+        else:
+            raise ValueError(f"Unsupported observation shape: {obs_shape}")
+        
+        print(f"[DEBUG] MAPPO - Detected {self.num_agents} agents with obs_dim {self.obs_dim}")
+        
+        # Get global state dimension for centralized critic
+        if hasattr(self.env, 'get_global_state_dim'):
+            self.global_state_dim = self.env.get_global_state_dim()
+        elif hasattr(self.env, 'global_state_dim'):
+            self.global_state_dim = self.env.global_state_dim
+        else:
+            # Default: concatenated agent observations
+            self.global_state_dim = self.num_agents * self.obs_dim
+        
+        print(f"[DEBUG] MAPPO - Using global_state_dim: {self.global_state_dim}")
+        
+        # Agent with MAPPO architecture
+        self.agent = MAPPOAgent(
+            self.env.observation_space,
+            self.env.action_space,
+            hidden_dim=self.hidden_dim,
+            use_clipped_value=self.use_clipped_value,
+            clip_param=self.clip_param,
+            target_kl=self.target_kl,
+            entropy_coef=self.entropy_coef,
+            actor_lr=self.actor_lr,
+            critic_lr=self.critic_lr,
+            opt_epochs=self.opt_epochs,
+            mini_batch_size=self.mini_batch_size,
+            activation=self.activation,
+            share_actor_weights=self.share_actor_weights,
+            centralized_critic=self.centralized_critic,
+            include_actions_in_critic=self.include_actions_in_critic,
+            global_state_dim=self.global_state_dim
+        )
         self.agent.to(self.device)
         
         # Pre-/post-processing.
@@ -95,6 +127,8 @@ class MAPPO(BaseController):
             self.total_steps = 0
             obs, _ = self.env.reset()
             self.obs = self.obs_normalizer(obs)
+            self.episode_return = 0
+            self.episode_length = 0
         else:
             # Add episodic stats to be tracked.
             self.env.add_tracker('constraint_violation', 0, mode='queue')
@@ -108,9 +142,7 @@ class MAPPO(BaseController):
             self.eval_env.close()
         self.logger.close()
 
-    def save(self,
-             path
-             ):
+    def save(self, path):
         '''Saves model params and experiment state to checkpoint path.'''
         path_dir = os.path.dirname(path)
         os.makedirs(path_dir, exist_ok=True)
@@ -119,7 +151,6 @@ class MAPPO(BaseController):
             'obs_normalizer': self.obs_normalizer.state_dict(),
             'reward_normalizer': self.reward_normalizer.state_dict(),
         }
-        # In the save method around line 127:
         if self.training:
             exp_state = {
                 'total_steps': self.total_steps,
@@ -130,31 +161,30 @@ class MAPPO(BaseController):
             state_dict.update(exp_state)
         torch.save(state_dict, path)
 
-    def load(self,
-             path
-             ):
+    def load(self, path):
         '''Restores model and experiment given checkpoint path.'''
-        state = torch.load(path, weights_only=False)  # Safe since we're loading our own models
+        # First try with weights_only=False to avoid the numpy issue
+        state = torch.load(path, map_location=self.device, weights_only=False)
+        
         # Restore policy.
         self.agent.load_state_dict(state['agent'])
         self.obs_normalizer.load_state_dict(state['obs_normalizer'])
         self.reward_normalizer.load_state_dict(state['reward_normalizer'])
         # Restore experiment state.
-        # In the load method:
         if self.training:
             self.total_steps = state['total_steps']
             self.obs = state['obs']
             set_random_state(state['random_state'])
             if state.get('env_random_state') is not None and hasattr(self.env, 'set_env_random_state'):
                 self.env.set_env_random_state(state['env_random_state'])
-
+                
     def select_action(self, obs, info=None):
         '''Determine the action to take at the current timestep.
-
+        
         Args:
             obs (ndarray): The observation at this timestep.
             info (dict): The info at this timestep.
-
+            
         Returns:
             action (ndarray): The action chosen by the controller.
         '''
@@ -165,10 +195,7 @@ class MAPPO(BaseController):
             action = self.agent.ac.act(obs)
         return action
 
-    def learn(self,
-          env=None,
-          **kwargs
-          ):
+    def learn(self, env=None, **kwargs):
         '''Performs learning (pre-training, training, fine-tuning, etc).'''
 
         # Import tqdm for progress bar
@@ -180,12 +207,17 @@ class MAPPO(BaseController):
             print("tqdm not available, continuing without progress bar...")
 
         # Print training header
-        print(f"\nStarting PPO Training")
+        print(f"\n{'='*60}")
+        print(f"Starting MAPPO Training")
+        print(f"{'='*60}")
+        print(f"Agents: {self.num_agents}")
+        print(f"Centralized Critic: {self.centralized_critic}")
+        print(f"Shared Actor Weights: {self.share_actor_weights}")
         print(f"Target: {self.max_env_steps} total steps")
-        print(f"Logging every {self.log_interval} steps")
-        print(f"Evaluating every {self.eval_interval} steps")
-        print(f"\n{'Step':>8} {'Return':>12} {'Length':>8} {'Value Loss':>12} {'Policy Loss':>12} {'Entropy':>10}")
-        print("-" * 80)
+        print(f"Rollout Steps: {self.rollout_steps}")
+        print(f"Optimization Epochs: {self.opt_epochs}")
+        print(f"Mini-batch Size: {self.mini_batch_size}")
+        print(f"{'='*60}\n")
 
         # Initialize progress bar
         if TQDM_AVAILABLE:
@@ -210,13 +242,13 @@ class MAPPO(BaseController):
                     ep_returns = np.asarray(self.env.return_queue)
                     if len(ep_returns) > 0:
                         mean_return = ep_returns.mean()
-                        pbar.set_description(f"Training (Return: {mean_return:.1f})")
+                        pbar.set_description(f"MAPPO (Return: {mean_return:.1f})")
 
             # === LIVE TERMINAL LOGGING ===
             if self.total_steps % self.log_interval == 0:
                 # Get current stats
-                ep_returns = np.asarray(self.env.return_queue)
                 ep_lengths = np.asarray(self.env.length_queue)
+                ep_returns = np.asarray(self.env.return_queue)
                 
                 if len(ep_returns) > 0:
                     mean_return = ep_returns.mean()
@@ -229,10 +261,14 @@ class MAPPO(BaseController):
                 policy_loss = results.get('policy_loss', 0)
                 value_loss = results.get('value_loss', 0)
                 entropy_loss = results.get('entropy_loss', 0)
+                approx_kl = results.get('approx_kl', 0)
                 
                 # Print to terminal
+                print(f"{'Step':>8} {'Return':>12} {'Length':>8} {'Value Loss':>12} {'Policy Loss':>12} {'Entropy':>10} {'KL':>8}")
+                print("-" * 80)
                 print(f"{self.total_steps:8d} {mean_return:12.2f} {mean_length:8.1f} "
-                    f"{value_loss:12.4f} {policy_loss:12.4f} {entropy_loss:10.4f}")
+                    f"{value_loss:12.4f} {policy_loss:12.4f} {entropy_loss:10.4f} {approx_kl:8.4f}")
+                print("-" * 80)
 
             # Checkpoint.
             if self.total_steps >= self.max_env_steps or (self.save_interval and self.total_steps % self.save_interval == 0):
@@ -262,15 +298,17 @@ class MAPPO(BaseController):
                 eval_std = eval_results['ep_returns'].std()
                 eval_length = eval_results['ep_lengths'].mean()
                 
-                print(f"⭐ [EVAL] Step {self.total_steps}: Return {eval_return:.2f} +/- {eval_std:.2f}, Length: {eval_length:.1f}")
+                print(f"\n⭐ [EVAL] Step {self.total_steps}:")
+                print(f"   Return: {eval_return:.2f} +/- {eval_std:.2f}")
+                print(f"   Length: {eval_length:.1f}")
                 
                 # Color code evaluation results based on performance
                 if eval_return > 0:
-                    print(f"🎉 Good progress! Average return: {eval_return:.2f}")
+                    print(f"   🎉 Good progress!")
                 elif eval_return > -100:
-                    print(f"📊 Learning... Average return: {eval_return:.2f}")
+                    print(f"   📊 Learning...")
                 else:
-                    print(f"🔄 Needs improvement... Average return: {eval_return:.2f}")
+                    print(f"   🔄 Needs improvement...")
                 
                 self.logger.info('Eval | ep_lengths {:.2f} +/- {:.2f} | ep_return {:.3f} +/- {:.3f}'.format(
                     eval_results['ep_lengths'].mean(),
@@ -284,7 +322,7 @@ class MAPPO(BaseController):
                 if self.eval_save_best and eval_best_score < eval_score:
                     self.eval_best_score = eval_score
                     self.save(os.path.join(self.output_dir, 'model_best.pt'))
-                    print(f"🏆 New best model! Score: {eval_score:.2f} (saved)")
+                    print(f"   🏆 New best model! Score: {eval_score:.2f} (saved)")
                     
             # Logging to files/tensorboard.
             if self.log_interval and self.total_steps % self.log_interval == 0:
@@ -294,8 +332,10 @@ class MAPPO(BaseController):
         if TQDM_AVAILABLE:
             pbar.close()
         
-        print("✅ Training completed successfully!")
+        print("\n" + "="*60)
+        print("✅ MAPPO Training completed successfully!")
         print(f"📁 Final model saved to: {self.checkpoint_path}")
+        print("="*60)
         
         # Final evaluation
         print("\n🔍 Running final evaluation...")
@@ -309,12 +349,7 @@ class MAPPO(BaseController):
         self.save(final_path)
         print(f"💾 Final model saved to: {final_path}")
 
-    def run(self,
-            env=None,
-            render=False,
-            n_episodes=10,
-            verbose=False,
-            ):
+    def run(self, env=None, render=False, n_episodes=10, verbose=False):
         '''Runs evaluation with current policy.'''
         self.agent.eval()
         self.obs_normalizer.set_read_only()
@@ -363,25 +398,72 @@ class MAPPO(BaseController):
             eval_results.update(queued_stats)
         return eval_results
 
+    def _get_global_observation(self, local_obs):
+        """Get global observation for centralized critic.
+        
+        Args:
+            local_obs: Local observations from environment
+            
+        Returns:
+            global_obs: Global observation for centralized critic
+        """
+        if hasattr(self.env, 'get_global_state'):
+            # Environment provides global state
+            global_obs = self.env.get_global_state()
+        elif hasattr(self.env, 'global_state'):
+            global_obs = self.env.global_state
+        else:
+            # Default: concatenate agent observations
+            if isinstance(local_obs, np.ndarray):
+                if local_obs.ndim == 2 and local_obs.shape[0] > 1:
+                    # Multi-agent: (num_agents, obs_dim)
+                    global_obs = local_obs.flatten()
+                elif local_obs.ndim == 1:
+                    # Single agent or already flattened
+                    global_obs = local_obs
+                else:
+                    # Reshape to ensure it's 1D
+                    global_obs = local_obs.reshape(-1)
+            else:
+                # Assume it's already in the right format
+                global_obs = local_obs
+        
+        # Ensure it's a numpy array
+        if not isinstance(global_obs, np.ndarray):
+            global_obs = np.array(global_obs)
+        
+        return global_obs
+
     def train_step(self):
-        '''Performs a training/fine-tuning step.'''
+        '''Performs a MAPPO training/fine-tuning step.'''
         self.agent.train()
         self.obs_normalizer.unset_read_only()
         
-        # Use batch_size=1 since we're using a single environment
-        rollouts = MAPPOBuffer(self.env.observation_space, self.env.action_space, self.rollout_steps, batch_size=1)
+        # Initialize buffer with global state support for centralized critic
+        rollouts = MAPPOBuffer(
+            self.env.observation_space,
+            self.env.action_space,
+            self.rollout_steps,
+            batch_size=1,
+            include_global_state=self.centralized_critic,
+            global_state_dim=self.global_state_dim,
+            include_actions_in_critic=self.include_actions_in_critic
+        )
+        
         obs = self.obs
         start = time.time()
         
+        # Collect rollouts
         for step in range(self.rollout_steps):
             with torch.inference_mode():
-                # Ensure obs is properly shaped for multi-agent
+                # Get actions from decentralized actors
                 obs_tensor = torch.FloatTensor(obs).to(self.device)
                 act, v, logp = self.agent.ac.step(obs_tensor)
             
             # Debug: Check action shape
-            #print(f"[DEBUG] Step {step}: Action shape: {act.shape}, Action: {act}")
+            # print(f"[DEBUG] Step {step}: Action shape: {act.shape}, Action: {act}")
             
+            # Step environment
             step_result = self.env.step(act)
             if len(step_result) == 5:
                 next_obs, rew, terminated, truncated, info = step_result
@@ -395,41 +477,44 @@ class MAPPO(BaseController):
             if isinstance(rew, (float, int)):
                 rew = np.array([rew])
 
+            # Normalize observations and rewards
             next_obs = self.obs_normalizer(next_obs)
             rew = self.reward_normalizer(rew, done)
             mask = 1 - done.astype(float)
 
-            # Time truncation is not the same as true termination.
+            # Get value estimate for time truncation handling
             terminal_v = np.zeros_like(v)
             if 'terminal_info' in info and info['terminal_info'].get('TimeLimit.truncated', False):
                 terminal_obs = info['terminal_observation']
                 terminal_obs_tensor = torch.FloatTensor(terminal_obs).to(self.device)
-                terminal_val = self.agent.ac.critic(terminal_obs_tensor).squeeze().detach().cpu().numpy()
+                # Get terminal value from critic
+                if self.centralized_critic:
+                    terminal_global_obs = self._get_global_observation(terminal_obs)
+                    terminal_global_obs_tensor = torch.FloatTensor(terminal_global_obs).to(self.device).unsqueeze(0)
+                    terminal_val = self.agent.ac.get_value(terminal_global_obs_tensor).detach().cpu().numpy()
+                else:
+                    terminal_val = self.agent.ac.get_value(terminal_obs_tensor, agent_idx=0).detach().cpu().numpy()
                 terminal_v = terminal_val
 
-                        # Debug: check shapes before pushing to buffer
-            #print(f"[DEBUG] Shapes before push - obs: {obs.shape}, act: {act.shape}, rew: {rew.shape}, mask: {mask.shape}, v: {v.shape}, logp: {logp.shape}")
+            # Get global observation for centralized critic
+            global_obs = None
+            if self.centralized_critic:
+                global_obs = self._get_global_observation(obs)
 
-            # Detect if we're in multi-agent mode and get number of agents
+            # Fix shapes based on single vs multi-agent
             is_multi_agent = len(obs.shape) > 1 and obs.shape[0] > 1
             if is_multi_agent:
                 num_agents = obs.shape[0]
-            else:
-                num_agents = 1
-
-            # Fix shapes based on single vs multi-agent
-            if is_multi_agent:
-                # Multi-agent case
+                
+                # Ensure rewards and masks have correct shape for multi-agent
                 if rew.shape == (1,) or (rew.ndim == 1 and rew.shape[0] == 1):
                     rew = np.full((num_agents, 1), rew[0])  # Expand to (num_agents, 1)
                 elif rew.ndim == 2 and rew.shape[0] != num_agents:
-                    # Reshape to match current number of agents
                     rew = np.full((num_agents, 1), rew[0, 0] if rew.shape[0] > 0 else rew[0])
                 
                 if mask.shape == (1,) or (mask.ndim == 1 and mask.shape[0] == 1):
                     mask = np.full((num_agents, 1), mask[0])  # Expand to (num_agents, 1)
                 elif mask.ndim == 2 and mask.shape[0] != num_agents:
-                    # Reshape to match current number of agents
                     mask = np.full((num_agents, 1), mask[0, 0] if mask.shape[0] > 0 else mask[0])
                 
                 # Remove extra dimension from v and logp if needed
@@ -443,8 +528,16 @@ class MAPPO(BaseController):
                 elif logp.ndim == 2 and logp.shape[0] != num_agents:
                     logp = np.full((num_agents, 1), logp[0, 0] if logp.shape[0] > 0 else logp[0])
                     
+                # Ensure terminal_v has the right shape
+                if terminal_v.shape == () or terminal_v.size == 1:
+                    terminal_v = np.zeros((num_agents, 1))
+                elif terminal_v.ndim == 3 and terminal_v.shape[-1] == 1:
+                    terminal_v = terminal_v.reshape(num_agents, 1)
+                elif terminal_v.ndim == 2 and terminal_v.shape[0] != num_agents:
+                    terminal_v = np.zeros((num_agents, 1))
             else:
                 # Single-agent case
+                num_agents = 1
                 if rew.shape == (1,) or (rew.ndim == 1 and rew.shape[0] == 1):
                     rew = rew.reshape(1, 1)  # Shape: (1, 1)
                 elif rew.ndim == 2 and rew.shape[0] > 1:
@@ -464,21 +557,36 @@ class MAPPO(BaseController):
                     logp = logp.reshape(1, 1)  # Shape: (1, 1)
                 elif logp.ndim == 2 and logp.shape[0] > 1:
                     logp = logp[:1, :]  # Take first agent's log probability
+                
+                # Ensure terminal_v has the right shape
+                if terminal_v.shape == () or terminal_v.size == 1:
+                    terminal_v = np.zeros((1, 1))
+                elif terminal_v.ndim == 3 and terminal_v.shape[-1] == 1:
+                    terminal_v = terminal_v.reshape(1, 1)
+                elif terminal_v.ndim == 2 and terminal_v.shape[0] > 1:
+                    terminal_v = terminal_v[:1, :]
 
-            # Ensure terminal_v has the right shape
-            if terminal_v.shape == ():
-                terminal_v = np.zeros_like(v)
-            elif terminal_v.ndim == 3 and terminal_v.shape[-1] == 1:
-                terminal_v = terminal_v.reshape(v.shape)
-            elif terminal_v.ndim == 2 and terminal_v.shape[0] != v.shape[0]:
-                terminal_v = np.zeros_like(v)
-
-            #print(f"[DEBUG] Shapes after fix - obs: {obs.shape}, act: {act.shape}, rew: {rew.shape}, mask: {mask.shape}, v: {v.shape}, logp: {logp.shape}")
-            #print(f"[DEBUG] Mode: {'multi-agent' if is_multi_agent else 'single-agent'}, num_agents: {num_agents}")
-
-            rollouts.push({'obs': obs, 'act': act, 'rew': rew, 'mask': mask, 'v': v, 'logp': logp, 'terminal_v': terminal_v})
+            # Prepare data for buffer
+            buffer_data = {
+                'obs': obs,
+                'act': act,
+                'rew': rew,
+                'mask': mask,
+                'v': v,
+                'logp': logp,
+                'terminal_v': terminal_v
+            }
+            
+            # Add global observation for centralized critic
+            if self.centralized_critic and global_obs is not None:
+                buffer_data['global_obs'] = global_obs
+            
+            # Push to buffer
+            rollouts.push(buffer_data)
+            
             obs = next_obs
-                        
+            
+            # Reset if episode done
             if done:
                 obs, _ = self.env.reset()
                 obs = self.obs_normalizer(obs)
@@ -486,30 +594,73 @@ class MAPPO(BaseController):
         self.obs = obs
         self.total_steps += self.rollout_steps
         
-       # Get last value for returns computation
-        obs_tensor = torch.FloatTensor(obs).to(self.device)
-        last_val_full = self.agent.ac.critic(obs_tensor).detach().cpu().numpy()
-
-        # Ensure last_val has the right shape for multi-agent
-        if last_val_full.shape == (2, 1, 1):  # Multi-agent with extra dimension
-            last_val = last_val_full.reshape(1, 2, 1)  # Reshape to (N, num_agents, 1)
-        else:
-            last_val = last_val_full
-
-        ret, adv = compute_returns_and_advantages(rollouts.rew,
-                                                rollouts.v,
-                                                rollouts.mask,
-                                                rollouts.terminal_v,
-                                                last_val,
-                                                gamma=self.gamma,
-                                                use_gae=self.use_gae,
-                                                gae_lambda=self.gae_lambda)
-        rollouts.ret = ret
-        # Prevent divide-by-0 for repetitive tasks.
-        rollouts.adv = (adv - adv.mean()) / (adv.std() + 1e-6)
+        # Get last value for returns computation
+        with torch.inference_mode():
+            obs_tensor = torch.FloatTensor(obs).to(self.device)
+            
+            if self.centralized_critic:
+                # Get global observation for centralized critic
+                last_global_obs = self._get_global_observation(obs)
+                last_global_obs_tensor = torch.FloatTensor(last_global_obs).to(self.device).unsqueeze(0)
+                last_val = self.agent.ac.get_value(last_global_obs_tensor).detach().cpu().numpy()
+                
+                # Reshape to match expected format
+                if last_val.shape == (1, 1):
+                    # Single value for all agents
+                    if is_multi_agent:
+                        last_val = np.full((self.num_agents, 1), last_val[0, 0])
+                    else:
+                        last_val = last_val[0, 0]
+                elif last_val.shape[0] == 1 and last_val.shape[1] > 1:
+                    # Multiple values in batch dimension
+                    last_val = last_val[0]
+            else:
+                # Decentralized critic (IPPO-style)
+                if is_multi_agent:
+                    last_vals = []
+                    for i in range(self.num_agents):
+                        agent_obs = obs_tensor[i].unsqueeze(0) if obs_tensor.dim() > 1 else obs_tensor
+                        agent_val = self.agent.ac.get_value(agent_obs, agent_idx=i).detach().cpu().numpy()
+                        last_vals.append(agent_val)
+                    last_val = np.array(last_vals)
+                else:
+                    last_val = self.agent.ac.get_value(obs_tensor, agent_idx=0).detach().cpu().numpy()
         
+        # Ensure last_val has proper shape for compute_returns_and_advantages
+        if isinstance(last_val, np.ndarray):
+            if last_val.ndim == 0:
+                last_val = last_val.item()
+            elif last_val.ndim == 1 and last_val.shape[0] > 1:
+                # Multi-agent: ensure shape (num_agents, 1)
+                last_val = last_val.reshape(-1, 1)
+            elif last_val.ndim == 2 and last_val.shape[1] == 1:
+                # Already correct shape
+                pass
+        
+        # Compute returns and advantages
+        ret, adv = compute_returns_and_advantages(
+            rollouts.rew,
+            rollouts.v,
+            rollouts.mask,
+            rollouts.terminal_v,
+            last_val,
+            gamma=self.gamma,
+            use_gae=self.use_gae,
+            gae_lambda=self.gae_lambda
+        )
+        
+        # Store computed returns and normalized advantages
+        rollouts.ret = ret
+        rollouts.adv = normalize_advantages(adv)
+        
+        # Update agent
         results = self.agent.update(rollouts, self.device)
         results.update({'step': self.total_steps, 'elapsed_time': time.time() - start})
+        
+        # Update episode statistics
+        self.episode_return += np.sum(rollouts.rew) / self.rollout_steps
+        self.episode_length += self.rollout_steps
+        
         return results
 
     def log_step(self, results):
@@ -551,7 +702,6 @@ class MAPPO(BaseController):
                 eval_lengths = results['eval']['ep_lengths']
                 print(f"{'EVAL':>8} {eval_returns.mean():12.2f} {eval_lengths.mean():8.1f} "
                     f"{'':>12} {'':>12} {'':>10} {'':>8}")
-        # === END LIVE TERMINAL LOGGING ===
         
         # Original logging code (keep this)
         # runner stats
@@ -563,6 +713,7 @@ class MAPPO(BaseController):
             },
             step,
             prefix='time')
+        
         # Learning stats.
         self.logger.add_scalars(
             {
@@ -571,36 +722,47 @@ class MAPPO(BaseController):
             },
             step,
             prefix='loss')
+        
         # Performance stats.
         ep_lengths = np.asarray(self.env.length_queue)
         ep_returns = np.asarray(self.env.return_queue)
-        ep_constraint_violation = np.asarray(self.env.queued_stats['constraint_violation'])
+        if 'constraint_violation' in self.env.queued_stats:
+            ep_constraint_violation = np.asarray(self.env.queued_stats['constraint_violation'])
+        else:
+            ep_constraint_violation = np.zeros_like(ep_returns)
+        
         self.logger.add_scalars(
             {
                 'ep_length': ep_lengths.mean(),
                 'ep_return': ep_returns.mean(),
-                'ep_reward': (ep_returns / ep_lengths).mean(),
+                'ep_reward': (ep_returns / ep_lengths).mean() if len(ep_lengths) > 0 and ep_lengths.mean() > 0 else 0,
                 'ep_constraint_violation': ep_constraint_violation.mean()
             },
             step,
             prefix='stat')
+        
         # Total constraint violation during learning.
-        total_violations = self.env.accumulated_stats['constraint_violation']
-        self.logger.add_scalars({'constraint_violation': total_violations}, step, prefix='stat')
+        if 'constraint_violation' in self.env.accumulated_stats:
+            total_violations = self.env.accumulated_stats['constraint_violation']
+            self.logger.add_scalars({'constraint_violation': total_violations}, step, prefix='stat')
+        
         if 'eval' in results:
             eval_ep_lengths = results['eval']['ep_lengths']
             eval_ep_returns = results['eval']['ep_returns']
-            eval_constraint_violation = results['eval']['constraint_violation']
-            eval_mse = results['eval']['mse']
+            
+            eval_constraint_violation = results['eval'].get('constraint_violation', np.zeros_like(eval_ep_returns))
+            eval_mse = results['eval'].get('mse', np.zeros_like(eval_ep_returns))
+            
             self.logger.add_scalars(
                 {
                     'ep_length': eval_ep_lengths.mean(),
                     'ep_return': eval_ep_returns.mean(),
-                    'ep_reward': (eval_ep_returns / eval_ep_lengths).mean(),
+                    'ep_reward': (eval_ep_returns / eval_ep_lengths).mean() if len(eval_ep_lengths) > 0 and eval_ep_lengths.mean() > 0 else 0,
                     'constraint_violation': eval_constraint_violation.mean(),
                     'mse': eval_mse.mean()
                 },
                 step,
                 prefix='stat_eval')
+        
         # Print summary table
         self.logger.dump_scalars()
