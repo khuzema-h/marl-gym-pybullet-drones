@@ -32,13 +32,13 @@ from gym_pybullet_drones.utils.enums import ObservationType, ActionType
 
 # Import from your modular PPO implementation
 try:
-    from ppo import PPO, PPO_CONFIG
-    from ppo.agent import PPOAgent
-    from ppo.buffer import PPOBuffer
-    print("✓ Successfully imported PPO modules")
+    from mappo import MAPPO, MAPPO_CONFIG
+    from mappo.agent import MAPPOAgent
+    from mappo.buffer import MAPPOBuffer
+    print("✓ Successfully imported MAPPO modules")
 except ImportError as e:
-    print(f"✗ Error importing PPO modules: {e}")
-    print("Looking for PPO module in:")
+    print(f"✗ Error importing MAPPO modules: {e}")
+    print("Looking for MAPPO module in:")
     print(f"  Current directory: {current_dir}")
     print(f"  Parent directory: {parent_dir}")
     print("Available directories in parent:")
@@ -62,7 +62,7 @@ DEFAULT_MA = False
 
 # WandB configuration
 DEFAULT_USE_WANDB = True and WANDB_AVAILABLE
-DEFAULT_WANDB_PROJECT = "gym-pybullet-drones-ppo"
+DEFAULT_WANDB_PROJECT = "gym-pybullet-drones-mappo"
 DEFAULT_WANDB_ENTITY = None
 
 def create_env(multiagent=False, gui=False, record_video=False, num_drones=1, seed=None):
@@ -120,8 +120,8 @@ def run(multiagent=DEFAULT_MA,
                          num_drones=DEFAULT_AGENTS if multiagent else 1, seed=seed)
 
     # Custom PPO configuration
-    ppo_config = PPO_CONFIG.copy()
-    ppo_config.update({
+    mappo_config = MAPPO_CONFIG.copy()
+    mappo_config.update({
         'output_dir': filename,
         'checkpoint_path': os.path.join(filename, 'model_latest.pt'),
         'max_env_steps': int(1e7) if local else int(1e2),
@@ -140,23 +140,23 @@ def run(multiagent=DEFAULT_MA,
 
     # Log configuration to WandB
     if use_wandb:
-        wandb_run.config.update(ppo_config)
+        wandb_run.config.update(mappo_config)
 
     # Initialize PPO controller
     print("Initializing PPO controller...")
-    ppo_controller = PPO(
+    mappo_controller = MAPPO(
         env_func=env_func,
         training=True,
-        **ppo_config
+        **mappo_config
     )
 
     # Reset the environment
-    ppo_controller.reset()
+    mappo_controller.reset()
 
     # Training
     print("Starting training...")
     try:
-        ppo_controller.learn()
+        mappo_controller.learn()
         print("Training completed successfully!")
     except KeyboardInterrupt:
         print("Training interrupted by user!")
@@ -166,7 +166,7 @@ def run(multiagent=DEFAULT_MA,
 
     # Save final model
     final_model_path = os.path.join(filename, 'final_model.pt')
-    ppo_controller.save(final_model_path)
+    mappo_controller.save(final_model_path)
     print(f"Final model saved to: {final_model_path}")
 
     ############################################################
@@ -177,10 +177,10 @@ def run(multiagent=DEFAULT_MA,
     best_model_path = os.path.join(filename, 'model_best.pt')
     if os.path.exists(best_model_path):
         print("Loading best model for evaluation...")
-        ppo_controller.load(best_model_path)
+        mappo_controller.load(best_model_path)
     else:
         print("Best model not found, using final model...")
-        ppo_controller.load(final_model_path)
+        mappo_controller.load(final_model_path)
 
     # Create test environment
     print("Creating test environment...")
@@ -203,7 +203,7 @@ def run(multiagent=DEFAULT_MA,
 
     # Run evaluation
     print("Running evaluation...")
-    eval_results = ppo_controller.run(
+    eval_results = mappo_controller.run(
         env=test_env, 
         n_episodes=5,
         render=False  # Don't render during batch evaluation
@@ -229,7 +229,7 @@ def run(multiagent=DEFAULT_MA,
     start = time.time()
     
     for i in range((test_env.EPISODE_LEN_SEC + 2) * test_env.CTRL_FREQ):
-        action = ppo_controller.select_action(obs, info)
+        action = mappo_controller.select_action(obs, info)
         obs, reward, terminated, truncated, info = test_env.step(action)
         
         # Log data for visualization
@@ -294,35 +294,35 @@ def run(multiagent=DEFAULT_MA,
     print(f"\nTraining and evaluation completed!")
     print(f"Results saved to: {filename}")
 
-def test_ppo_components():
-    """Test function to verify PPO components are working correctly."""
-    print("Testing PPO components...")
+def test_mappo_components():
+    """Test function to verify MAPPO components are working correctly."""
+    print("Testing MAPPO components...")
     
     # Test buffer
     try:
         import gymnasium as gym
         test_env = gym.make('Pendulum-v1')
-        buffer = PPOBuffer(
+        buffer = MAPPOBuffer(
             test_env.observation_space,
             test_env.action_space,
             max_length=100,
             batch_size=1
         )
-        print("✓ PPOBuffer initialized successfully")
+        print("✓  MAPPOBuffer initialized successfully")
         
         # Test agent
-        agent = PPOAgent(
+        agent = MAPPOAgent(
             test_env.observation_space,
             test_env.action_space,
             hidden_dim=64
         )
-        print("✓ PPOAgent initialized successfully")
+        print("✓ MAPPOAgent initialized successfully")
         
         test_env.close()
-        print("✓ All PPO components working correctly!")
+        print("✓ All MAPPO components working correctly!")
         
     except Exception as e:
-        print(f"✗ Error testing PPO components: {e}")
+        print(f"✗ Error testing MAPPO components: {e}")
         raise
 
 if __name__ == '__main__':
@@ -342,7 +342,7 @@ if __name__ == '__main__':
 
     # Test components if requested
     if ARGS.test_components:
-        test_ppo_components()
+        test_mappo_components()
         print("Component testing completed. Starting main training...")
     
     # Remove test_components from args before passing to run()

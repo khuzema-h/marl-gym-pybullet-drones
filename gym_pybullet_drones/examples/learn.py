@@ -129,7 +129,7 @@ def run(multiagent=DEFAULT_MA,
                                  verbose=1,
                                  best_model_save_path=filename+'/',
                                  log_path=filename+'/',
-                                 eval_freq=int(1000),
+                                 eval_freq=int(1),
                                  deterministic=True,
                                  render=False))
     
