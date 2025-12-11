@@ -10,6 +10,80 @@ from safe_control_gym.math_and_models.distributions import Categorical, Normal
 from safe_control_gym.math_and_models.neural_networks import MLP
 
 
+# class MLPActor(nn.Module):
+#     '''Actor MLP model for decentralized execution.'''
+    
+#     def __init__(self,
+#                  obs_dim,
+#                  act_dim,
+#                  hidden_dims,
+#                  activation,
+#                  discrete=False
+#                  ):
+#         super().__init__()
+#         self.pi_net = MLP(obs_dim, act_dim, hidden_dims, activation)
+#         self.discrete = discrete
+#         if discrete:
+#             self.dist_fn = lambda x: Categorical(logits=x)
+#         else:
+#             self.logstd = nn.Parameter(-0.5 * torch.ones(act_dim))
+#             self.dist_fn = lambda x: Normal(x, self.logstd.exp())
+
+#     def forward(self, obs, act=None):
+#         '''Forward pass for actor.
+        
+#         Args:
+#             obs: Observation tensor, shape can be:
+#                 - (obs_dim,): single observation
+#                 - (batch_size, obs_dim): batch of single-agent observations
+#                 - (batch_size, num_agents, obs_dim): batch of multi-agent observations
+#                 - (num_agents, obs_dim): single timestep multi-agent observations
+#             act: Action tensor (optional), same shape considerations as obs
+            
+#         Returns:
+#             dist: Action distribution
+#             logp_a: Log probability of actions if act provided, else None
+#         '''
+#         # Handle different observation shapes
+#         if len(obs.shape) == 3:
+#             # Multi-agent batch: (batch_size, num_agents, obs_dim)
+#             batch_size, num_agents, obs_dim = obs.shape
+#             obs_flat = obs.reshape(-1, obs_dim)
+#             dist = self.dist_fn(self.pi_net(obs_flat))
+#             logp_a = None
+#             if act is not None:
+#                 act_flat = act.reshape(-1, act.shape[-1])
+#                 logp_a = dist.log_prob(act_flat)
+#                 logp_a = logp_a.reshape(batch_size, num_agents, -1)
+#             return dist, logp_a
+#         elif len(obs.shape) == 2:
+#             # Could be single agent batch or multi-agent single step
+#             if obs.shape[0] > 1 and obs.shape[1] < 50:  # Likely multi-agent
+#                 # Multi-agent single step: (num_agents, obs_dim)
+#                 num_agents, obs_dim = obs.shape
+#                 obs_flat = obs.reshape(-1, obs_dim)
+#                 dist = self.dist_fn(self.pi_net(obs_flat))
+#                 logp_a = None
+#                 if act is not None:
+#                     act_flat = act.reshape(-1, act.shape[-1])
+#                     logp_a = dist.log_prob(act_flat)
+#                     logp_a = logp_a.reshape(num_agents, -1)
+#                 return dist, logp_a
+#             else:
+#                 # Single agent batch: (batch_size, obs_dim)
+#                 dist = self.dist_fn(self.pi_net(obs))
+#                 logp_a = None
+#                 if act is not None:
+#                     logp_a = dist.log_prob(act)
+#                 return dist, logp_a
+#         else:
+#             # Single observation: (obs_dim,)
+#             dist = self.dist_fn(self.pi_net(obs.unsqueeze(0)))
+#             logp_a = None
+#             if act is not None:
+#                 logp_a = dist.log_prob(act.unsqueeze(0))
+#             return dist, logp_a
+        
 class MLPActor(nn.Module):
     '''Actor MLP model for decentralized execution.'''
     
@@ -18,72 +92,60 @@ class MLPActor(nn.Module):
                  act_dim,
                  hidden_dims,
                  activation,
-                 discrete=False
+                 discrete=False,
+                 action_scale=1.0  # Add action scale parameter
                  ):
         super().__init__()
         self.pi_net = MLP(obs_dim, act_dim, hidden_dims, activation)
         self.discrete = discrete
+        self.action_scale = action_scale  # Store action scale
+        
         if discrete:
+            # For discrete actions, scaling doesn't make sense
             self.dist_fn = lambda x: Categorical(logits=x)
         else:
             self.logstd = nn.Parameter(-0.5 * torch.ones(act_dim))
-            self.dist_fn = lambda x: Normal(x, self.logstd.exp())
+            # Create a distribution function that handles scaling
+            self.dist_fn = lambda x: self._create_normal_dist(x)
+
+    def _create_normal_dist(self, x):
+        """Create normal distribution with action scaling applied to mean."""
+        # Apply action scaling to the mean
+        scaled_mean = x * self.action_scale
+        return Normal(scaled_mean, self.logstd.exp())
 
     def forward(self, obs, act=None):
-        '''Forward pass for actor.
+        '''Forward pass for actor.'''
+        # Get raw network output
+        pi_output = self.pi_net(obs)
         
-        Args:
-            obs: Observation tensor, shape can be:
-                - (obs_dim,): single observation
-                - (batch_size, obs_dim): batch of single-agent observations
-                - (batch_size, num_agents, obs_dim): batch of multi-agent observations
-                - (num_agents, obs_dim): single timestep multi-agent observations
-            act: Action tensor (optional), same shape considerations as obs
+        # Create distribution (scaling applied in _create_normal_dist)
+        dist = self.dist_fn(pi_output)
+        
+        # Calculate log probability if action is provided
+        logp_a = None
+        if act is not None:
+            logp_a = dist.log_prob(act)
             
-        Returns:
-            dist: Action distribution
-            logp_a: Log probability of actions if act provided, else None
-        '''
-        # Handle different observation shapes
-        if len(obs.shape) == 3:
-            # Multi-agent batch: (batch_size, num_agents, obs_dim)
-            batch_size, num_agents, obs_dim = obs.shape
-            obs_flat = obs.reshape(-1, obs_dim)
-            dist = self.dist_fn(self.pi_net(obs_flat))
-            logp_a = None
-            if act is not None:
-                act_flat = act.reshape(-1, act.shape[-1])
-                logp_a = dist.log_prob(act_flat)
-                logp_a = logp_a.reshape(batch_size, num_agents, -1)
-            return dist, logp_a
-        elif len(obs.shape) == 2:
-            # Could be single agent batch or multi-agent single step
-            if obs.shape[0] > 1 and obs.shape[1] < 50:  # Likely multi-agent
-                # Multi-agent single step: (num_agents, obs_dim)
-                num_agents, obs_dim = obs.shape
-                obs_flat = obs.reshape(-1, obs_dim)
-                dist = self.dist_fn(self.pi_net(obs_flat))
-                logp_a = None
-                if act is not None:
-                    act_flat = act.reshape(-1, act.shape[-1])
-                    logp_a = dist.log_prob(act_flat)
-                    logp_a = logp_a.reshape(num_agents, -1)
-                return dist, logp_a
-            else:
-                # Single agent batch: (batch_size, obs_dim)
-                dist = self.dist_fn(self.pi_net(obs))
-                logp_a = None
-                if act is not None:
-                    logp_a = dist.log_prob(act)
-                return dist, logp_a
-        else:
-            # Single observation: (obs_dim,)
-            dist = self.dist_fn(self.pi_net(obs.unsqueeze(0)))
-            logp_a = None
-            if act is not None:
-                logp_a = dist.log_prob(act.unsqueeze(0))
-            return dist, logp_a
+        return dist, logp_a
+    
+    def get_scaled_action(self, obs, deterministic=False):
+        """Get action with scaling applied."""
+        # Get raw network output
+        pi_output = self.pi_net(obs)
         
+        # Create distribution (scaling already applied)
+        dist = self.dist_fn(pi_output)
+        
+        # Get action from distribution
+        if deterministic:
+            action = dist.mode()
+        else:
+            action = dist.sample()
+            
+        # For continuous actions, the scaling is already applied to the distribution mean
+        # So the sampled action should already be in the scaled range
+        return action        
         
 class MLPCritic(nn.Module):
     '''Simple MLP critic for decentralized value estimation.'''
@@ -172,7 +234,8 @@ class MAPPOActorCritic(nn.Module):
                  share_actor_weights=True,  # Whether to share actor parameters across agents
                  centralized_critic=True,   # Use centralized critic
                  include_actions_in_critic=False,  # Include actions in critic input
-                 global_state_dim=None      # Dimension of true global state (if None, use concatenated obs)
+                 global_state_dim=None,      # Dimension of true global state (if None, use concatenated obs)
+                 action_scale=1.0
                  ):
         super().__init__()
         
@@ -214,15 +277,17 @@ class MAPPOActorCritic(nn.Module):
         print(f"[DEBUG] MAPPOActorCritic - num_agents: {num_agents}, obs_dim: {obs_dim}, act_dim: {act_dim}")
         print(f"[DEBUG] MAPPOActorCritic - centralized_critic: {centralized_critic}, share_actor_weights: {share_actor_weights}")
         
+        self.action_scale = action_scale
+
         # Decentralized actors
         self.share_actor_weights = share_actor_weights
         if share_actor_weights:
             # Shared parameters across homogeneous agents
-            self.actor = MLPActor(obs_dim, act_dim, hidden_dims, activation, discrete)
+            self.actor = MLPActor(obs_dim, act_dim, hidden_dims, activation, discrete, action_scale)
         else:
             # Separate actors for each agent (for heterogeneous agents)
             self.actors = nn.ModuleList([
-                MLPActor(obs_dim, act_dim, hidden_dims, activation, discrete)
+                MLPActor(obs_dim, act_dim, hidden_dims, activation, discrete, action_scale)
                 for _ in range(num_agents)
             ])
         
@@ -301,6 +366,11 @@ class MAPPOActorCritic(nn.Module):
                 drone_obs = obs[i].unsqueeze(0)  # (1, obs_dim)
                 dist, _ = actor(drone_obs)
                 action = dist.sample()  # (1, act_dim)
+
+                # Apply action scaling
+                if hasattr(actor, 'action_scale') and actor.action_scale != 1.0:
+                    action = action * actor.action_scale
+
                 logp = dist.log_prob(action)  # (1,)
                 
                 actions.append(action.squeeze(0))
@@ -406,7 +476,7 @@ class MAPPOAgent:
     def __init__(self,
                  obs_space,
                  act_space,
-                 hidden_dim=64,
+                 hidden_dim=256,
                  use_clipped_value=False,
                  clip_param=0.2,
                  target_kl=0.01,
@@ -420,6 +490,7 @@ class MAPPOAgent:
                  centralized_critic=True,
                  include_actions_in_critic=False,
                  global_state_dim=None,
+                 action_scale=1.0,
                  **kwargs
                  ):
         # Parameters
@@ -440,6 +511,8 @@ class MAPPOAgent:
         print(f"[DEBUG] MAPPOAgent - share_actor_weights: {share_actor_weights}")
         print(f"[DEBUG] MAPPOAgent - include_actions_in_critic: {include_actions_in_critic}")
         
+        self.action_scale = action_scale
+
         # Model with centralized critic
         self.ac = MAPPOActorCritic(
             obs_space,
@@ -449,7 +522,8 @@ class MAPPOAgent:
             share_actor_weights=share_actor_weights,
             centralized_critic=centralized_critic,
             include_actions_in_critic=include_actions_in_critic,
-            global_state_dim=global_state_dim
+            global_state_dim=global_state_dim,
+            action_scale=action_scale
         )
         
         # Optimizers

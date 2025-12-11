@@ -28,9 +28,9 @@ class MAPPOBuffer(object):
         obs_shape = obs_space.shape
         act_shape = act_space.shape
         
-        print(f"[DEBUG] MAPPOBuffer - obs_shape: {obs_shape}, act_shape: {act_shape}")
-        print(f"[DEBUG] MAPPOBuffer - include_global_state: {include_global_state}")
-        print(f"[DEBUG] MAPPOBuffer - global_state_dim: {global_state_dim}")
+        # print(f"[DEBUG] MAPPOBuffer - obs_shape: {obs_shape}, act_shape: {act_shape}")
+        # print(f"[DEBUG] MAPPOBuffer - include_global_state: {include_global_state}")
+        # print(f"[DEBUG] MAPPOBuffer - global_state_dim: {global_state_dim}")
         
         # Detect single vs multi-agent
         # Single-agent: (obs_dim,) or (1, obs_dim)  
@@ -57,8 +57,8 @@ class MAPPOBuffer(object):
             obs_dim = obs_shape[1]
             scalar_vshape = (T, N, num_agents, 1)
         
-        print(f"[DEBUG] MAPPOBuffer - num_agents: {num_agents}, obs_dim: {obs_dim}")
-        print(f"[DEBUG] MAPPOBuffer - obs_vshape: {obs_vshape}, scalar_vshape: {scalar_vshape}")
+        # print(f"[DEBUG] MAPPOBuffer - num_agents: {num_agents}, obs_dim: {obs_dim}")
+        # print(f"[DEBUG] MAPPOBuffer - obs_vshape: {obs_vshape}, scalar_vshape: {scalar_vshape}")
         
         # Store shapes for later use
         self.num_agents = num_agents
@@ -123,7 +123,7 @@ class MAPPOBuffer(object):
                 'dtype': np.float32
             }
             
-            print(f"[DEBUG] MAPPOBuffer - Added global_obs with shape: {global_obs_vshape}")
+            # print(f"[DEBUG] MAPPOBuffer - Added global_obs with shape: {global_obs_vshape}")
         
         # Store global observation dimension for later use
         self.global_obs_dim = global_obs_dim if include_global_state else None

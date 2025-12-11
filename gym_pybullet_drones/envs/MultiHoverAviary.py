@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 
 from gym_pybullet_drones.envs.BaseRLAviary import BaseRLAviary
 from gym_pybullet_drones.utils.enums import DroneModel, Physics, ActionType, ObservationType
@@ -72,62 +73,111 @@ class MultiHoverAviary(BaseRLAviary):
 
     ################################################################################
     
+    # def _computeReward(self):
+    #     """Computes the current reward value.
+
+    #     Returns
+    #     -------
+    #     float
+    #         The reward.
+
+    #     """
+    #     states = np.array([self._getDroneStateVector(i) for i in range(self.NUM_DRONES)])
+    #     ret = 0
+    #     for i in range(self.NUM_DRONES):
+    #         ret += max(0, 2 - np.linalg.norm(self.TARGET_POS[i,:]-states[i][0:3])**4)
+    #     return ret
     def _computeReward(self):
-        """Computes the current reward value.
-
-        Returns
-        -------
-        float
-            The reward.
-
-        """
+        """Reward: distance-based, normalized between 0 and 1."""
         states = np.array([self._getDroneStateVector(i) for i in range(self.NUM_DRONES)])
-        ret = 0
+        reward = 0.0
+        
         for i in range(self.NUM_DRONES):
-            ret += max(0, 2 - np.linalg.norm(self.TARGET_POS[i,:]-states[i][0:3])**4)
-        return ret
+            pos = states[i, 0:3]
+            dist = np.linalg.norm(self.TARGET_POS[i] - pos)
+
+            # Distance-based reward (closer = higher)
+            shaped = np.exp(-2.0 * dist)     # smooth & stable shaping
+            reward += shaped
+
+        # Normalize by number of drones
+        reward /= self.NUM_DRONES
+        return reward
+
+
+
 
     ################################################################################
     
+    # def _computeTerminated(self):
+    #     """Computes the current done value.
+
+    #     Returns
+    #     -------
+    #     bool
+    #         Whether the current episode is done.
+
+    #     """
+    #     states = np.array([self._getDroneStateVector(i) for i in range(self.NUM_DRONES)])
+    #     dist = 0
+    #     for i in range(self.NUM_DRONES):
+    #         dist += np.linalg.norm(self.TARGET_POS[i,:]-states[i][0:3])
+    #     if dist < .0001:
+    #         return True
+    #     else:
+    #         return False
     def _computeTerminated(self):
-        """Computes the current done value.
-
-        Returns
-        -------
-        bool
-            Whether the current episode is done.
-
-        """
         states = np.array([self._getDroneStateVector(i) for i in range(self.NUM_DRONES)])
-        dist = 0
+
         for i in range(self.NUM_DRONES):
-            dist += np.linalg.norm(self.TARGET_POS[i,:]-states[i][0:3])
-        if dist < .0001:
-            return True
-        else:
-            return False
+            x, y, z = states[i, 0], states[i, 1], states[i, 2]
+            roll, pitch = states[i, 7], states[i, 8]
+
+            # Crash on ground
+            if z < 0.05:
+                return True
+            
+            # Excessive tilt → out of control
+            if abs(roll) > 0.8 or abs(pitch) > 0.8:
+                return True
+
+            # Escaped boundary
+            if abs(x) > 3.0 or abs(y) > 3.0 or z > 3.0:
+                return True
+
+        return False
+
+
 
     ################################################################################
     
+    # def _computeTruncated(self):
+    #     """Computes the current truncated value.
+
+    #     Returns
+    #     -------
+    #     bool
+    #         Whether the current episode timed out.
+
+    #     """
+    #     states = np.array([self._getDroneStateVector(i) for i in range(self.NUM_DRONES)])
+    #     for i in range(self.NUM_DRONES):
+    #         if (abs(states[i][0]) > 2.0 or abs(states[i][1]) > 2.0 or states[i][2] > 2.0 # Truncate when a drones is too far away
+    #          or abs(states[i][7]) > .4 or abs(states[i][8]) > .4 # Truncate when a drone is too tilted
+    #         ):
+    #             return True
+    #     if self.step_counter/self.PYB_FREQ > self.EPISODE_LEN_SEC:
+    #         return True
+    #     else:
+    #         return False
     def _computeTruncated(self):
-        """Computes the current truncated value.
-
-        Returns
-        -------
-        bool
-            Whether the current episode timed out.
-
-        """
-        states = np.array([self._getDroneStateVector(i) for i in range(self.NUM_DRONES)])
-        for i in range(self.NUM_DRONES):
-            if (abs(states[i][0]) > 2.0 or abs(states[i][1]) > 2.0 or states[i][2] > 2.0 # Truncate when a drones is too far away
-             or abs(states[i][7]) > .4 or abs(states[i][8]) > .4 # Truncate when a drone is too tilted
-            ):
-                return True
-        if self.step_counter/self.PYB_FREQ > self.EPISODE_LEN_SEC:
+        # Only truncate after episode time runs out
+        if self.step_counter / self.PYB_FREQ > self.EPISODE_LEN_SEC:
             return True
-        else:
-            return False
+        return False
+
+
+
 
     ################################################################################
     

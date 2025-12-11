@@ -58,7 +58,7 @@ DEFAULT_COLAB = False
 
 DEFAULT_OBS = ObservationType('kin')  # 'kin' or 'rgb'
 DEFAULT_ACT = ActionType('one_d_rpm')  # 'rpm' or 'pid' or 'vel' or 'one_d_rpm' or 'one_d_pid'
-DEFAULT_AGENTS = 2  # Start with 2 agents for easier training
+DEFAULT_AGENTS = 3  # Start with 2 agents for easier training
 DEFAULT_MA = True  # Default to multi-agent for MAPPO
 
 # WandB configuration
@@ -148,7 +148,7 @@ def run(multiagent=DEFAULT_MA,
     mappo_config.update({
         'output_dir': filename,
         'checkpoint_path': os.path.join(filename, 'model_latest.pt'),
-        'max_env_steps': int(1e6) if local else int(1e4),  # Reduced for testing
+        'max_env_steps': int(3e6) if local else int(1e4),  # Reduced for testing
         'eval_interval': 5000,
         'eval_batch_size': 3,
         'log_interval': 10,
@@ -160,25 +160,26 @@ def run(multiagent=DEFAULT_MA,
         'include_actions_in_critic': False,  # Don't include actions in critic input
         'global_state_dim': None,  # Auto-detect from environment
         # Training parameters
-        'hidden_dim': 64,
+        'hidden_dim': 256,
         'actor_lr': 0.0003,
         'critic_lr': 0.001,
-        'rollout_steps': 256,  # Reduced for testing
+        'rollout_steps': 64,  # Reduced for testing
         'rollout_batch_size': 1,  # Number of parallel environments
-        'opt_epochs': 5,  # Reduced for testing
+        'opt_epochs': 10,  # Reduced for testing
         'mini_batch_size': 32,
         'use_gae': True,
         'gae_lambda': 0.95,
         'gamma': 0.99,
-        'clip_param': 0.2,
+        'clip_param': 0.1,
         'target_kl': 0.01,
-        'entropy_coef': 0.01,
+        'entropy_coef': 0.0005,
         'use_clipped_value': False,
         # Normalization
         'norm_obs': True,
         'norm_reward': False,
         'clip_obs': 10,
         'clip_reward': 10,
+        'action_scale': 0.4,
     })
 
     # Log configuration to WandB
@@ -475,7 +476,7 @@ def test_mappo_components():
         agent = MAPPOAgent(
             test_env.observation_space,
             test_env.action_space,
-            hidden_dim=64,
+            hidden_dim=256,
             centralized_critic=True
         )
         print("✓ MAPPOAgent initialized successfully")
@@ -484,7 +485,7 @@ def test_mappo_components():
         multi_agent = MAPPOAgent(
             multi_obs_space,
             multi_act_space,
-            hidden_dim=64,
+            hidden_dim=256,
             centralized_critic=True,
             share_actor_weights=True
         )
