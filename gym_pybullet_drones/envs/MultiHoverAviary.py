@@ -69,7 +69,7 @@ class MultiHoverAviary(BaseRLAviary):
                          obs=obs,
                          act=act
                          )
-        self.TARGET_POS = self.INIT_XYZS
+        self.TARGET_POS = self.INIT_XYZS + np.array([[0,0,1/(i+1)] for i in range(num_drones)])
         # + np.array([[0,0,1/(i+1)] for i in range(num_drones)])
 
     ################################################################################
@@ -89,21 +89,32 @@ class MultiHoverAviary(BaseRLAviary):
     #         ret += max(0, 2 - np.linalg.norm(self.TARGET_POS[i,:]-states[i][0:3])**4)
     #     return ret
     def _computeReward(self):
-        """Reward: distance-based, normalized between 0 and 1."""
         states = np.array([self._getDroneStateVector(i) for i in range(self.NUM_DRONES)])
         reward = 0.0
-        
+
         for i in range(self.NUM_DRONES):
             pos = states[i, 0:3]
-            dist = np.linalg.norm(self.TARGET_POS[i] - pos)
+            vel = states[i, 3:6]
 
-            # Distance-based reward (closer = higher)
-            shaped = np.exp(-2.0 * dist)     # smooth & stable shaping
-            reward += shaped
+            # Position error
+            pos_error = self.TARGET_POS[i] - pos
+            dist_xy = np.linalg.norm(pos_error[0:2])
+            dist_z = pos_error[2]
 
-        # Normalize by number of drones
+            # Velocity penalty (especially vertical)
+            vel_z = vel[2]
+
+            # === Reward components ===
+            r_pos = np.exp(-2.0 * dist_xy)            # stay near XY
+            r_height = np.exp(-4.0 * abs(dist_z))    # strong height control
+            r_vel = -0.1 * vel_z**2                   # kill vertical speed
+
+            reward += r_pos + r_height + r_vel
+
+        # Normalize
         reward /= self.NUM_DRONES
         return reward
+
 
 
 

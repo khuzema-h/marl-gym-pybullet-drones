@@ -58,7 +58,7 @@ DEFAULT_COLAB = False
 
 DEFAULT_OBS = ObservationType('kin')  # 'kin' or 'rgb'
 DEFAULT_ACT = ActionType('one_d_rpm')  # 'rpm' or 'pid' or 'vel' or 'one_d_rpm' or 'one_d_pid'
-DEFAULT_AGENTS = 3  # Start with 2 agents for easier training
+DEFAULT_AGENTS = 5  # Start with 2 agents for easier training
 DEFAULT_MA = True  # Default to multi-agent for MAPPO
 
 # WandB configuration
@@ -100,7 +100,7 @@ def run(multiagent=DEFAULT_MA,
         use_wandb=DEFAULT_USE_WANDB,
         wandb_project=DEFAULT_WANDB_PROJECT,
         wandb_entity=DEFAULT_WANDB_ENTITY,
-        rollout_batch_size=8,
+        rollout_batch_size=128,
         num_workers=4,
         use_gpu=True,
         num_drones=None):
@@ -179,7 +179,7 @@ def run(multiagent=DEFAULT_MA,
     mappo_config.update({
         'output_dir': filename,
         'checkpoint_path': os.path.join(filename, 'model_latest.pt'),
-        'max_env_steps': int(3e6) if local else int(1e4),  # Reduced for testing
+        'max_env_steps': int(4e6) if local else int(1e4),  # Reduced for testing
         'eval_interval': 5000,
         'eval_batch_size': 3,
         'log_interval': 1,
