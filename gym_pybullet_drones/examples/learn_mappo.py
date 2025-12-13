@@ -99,8 +99,22 @@ def run(multiagent=DEFAULT_MA,
         local=True,
         use_wandb=DEFAULT_USE_WANDB,
         wandb_project=DEFAULT_WANDB_PROJECT,
-        wandb_entity=DEFAULT_WANDB_ENTITY):
+        wandb_entity=DEFAULT_WANDB_ENTITY,
+        rollout_batch_size=8,
+        num_workers=4,
+        use_gpu=True,
+        num_drones=None):
 
+    # Set number of drones/agents
+    global DEFAULT_AGENTS
+    if num_drones is None:
+        num_drones = DEFAULT_AGENTS
+    else:
+        # Update DEFAULT_AGENTS for this run
+        DEFAULT_AGENTS = num_drones
+    
+    print(f"✓ Training with {num_drones} agents")
+    
     # Initialize WandB
     wandb_run = None
     if use_wandb and WANDB_AVAILABLE:
@@ -112,7 +126,7 @@ def run(multiagent=DEFAULT_MA,
             save_code=True,
             config={
                 "multiagent": multiagent,
-                "num_agents": DEFAULT_AGENTS if multiagent else 1,
+                "num_agents": num_drones if multiagent else 1,
                 "obs_type": str(DEFAULT_OBS),
                 "act_type": str(DEFAULT_ACT)
             }
@@ -133,7 +147,7 @@ def run(multiagent=DEFAULT_MA,
     # Create environment function for MAPPO that accepts seed parameter
     def env_func(seed=None, **kwargs):
         return create_env(multiagent=multiagent, gui=False, record_video=False, 
-                         num_drones=DEFAULT_AGENTS if multiagent else 1, seed=seed)
+                         num_drones=num_drones if multiagent else 1, seed=seed)
 
     # Test the environment function
     print("Testing environment function...")
@@ -143,6 +157,23 @@ def run(multiagent=DEFAULT_MA,
     print(f"  Action space: {test_env.action_space}")
     test_env.close()
 
+    # Check GPU availability
+    use_gpu_flag = use_gpu and torch.cuda.is_available()
+    if use_gpu_flag:
+        print(f"✓ GPU available: {torch.cuda.get_device_name(0)}")
+        print(f"  CUDA version: {torch.version.cuda}")
+        print(f"  GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    else:
+        if use_gpu:
+            print("⚠ GPU requested but not available, using CPU")
+        else:
+            print("ℹ Using CPU (GPU disabled)")
+    
+    print(f"✓ Vectorized training configuration:")
+    print(f"  Parallel environments: {rollout_batch_size}")
+    print(f"  Number of workers: {num_workers}")
+    print(f"  This will speed up training by ~{rollout_batch_size}x")
+    
     # Custom MAPPO configuration
     mappo_config = MAPPO_CONFIG.copy()
     mappo_config.update({
@@ -151,8 +182,9 @@ def run(multiagent=DEFAULT_MA,
         'max_env_steps': int(3e6) if local else int(1e4),  # Reduced for testing
         'eval_interval': 5000,
         'eval_batch_size': 3,
-        'log_interval': 10,
+        'log_interval': 1,
         'save_interval': 20000,
+        'early_save_interval': 5000,  # Save more frequently for safety
         'tensorboard': use_wandb,
         # MAPPO-specific parameters
         'centralized_critic': True,  # Enable centralized critic for MAPPO
@@ -164,7 +196,8 @@ def run(multiagent=DEFAULT_MA,
         'actor_lr': 0.0003,
         'critic_lr': 0.001,
         'rollout_steps': 64,  # Reduced for testing
-        'rollout_batch_size': 1,  # Number of parallel environments
+        'rollout_batch_size': rollout_batch_size,  # Number of parallel environments
+        'num_workers': num_workers,  # Number of parallel processes for vectorized envs
         'opt_epochs': 10,  # Reduced for testing
         'mini_batch_size': 32,
         'use_gae': True,
@@ -194,15 +227,20 @@ def run(multiagent=DEFAULT_MA,
             print(f"  {key}: {value}")
     print("="*60 + "\n")
 
-    # Initialize MAPPO controller
+    # Initialize MAPPO controller with GPU support
     print("Initializing MAPPO controller...")
     try:
         mappo_controller = MAPPO(
             env_func=env_func,
             training=True,
+            use_gpu=use_gpu_flag,  # Enable GPU if available
             **mappo_config
         )
         print("✓ MAPPO controller initialized successfully")
+        print(f"  Device: {mappo_controller.device}")
+        print(f"  Vectorized environments: {mappo_controller.is_vectorized if hasattr(mappo_controller, 'is_vectorized') else 'N/A'}")
+        if hasattr(mappo_controller, 'num_envs'):
+            print(f"  Parallel environments: {mappo_controller.num_envs}")
     except Exception as e:
         print(f"✗ Error initializing MAPPO controller: {e}")
         import traceback
@@ -218,24 +256,56 @@ def run(multiagent=DEFAULT_MA,
     print("\n" + "="*60)
     print("STARTING MAPPO TRAINING")
     print("="*60)
+    
+    # Initialize model paths before try block to avoid UnboundLocalError
+    final_model_path = os.path.join(filename, 'model_final.pt')
+    
     try:
         mappo_controller.learn()
         print("✓ Training completed successfully!")
+        
+        # Save final model on successful completion
+        try:
+            mappo_controller.save(final_model_path)
+            print(f"✓ Final model saved to: {final_model_path}")
+        except Exception as e:
+            print(f"✗ Error saving final model: {e}")
+            
     except KeyboardInterrupt:
+        # Interruption is handled inside learn(), but ensure we close properly
         print("⚠ Training interrupted by user!")
+        # Model should already be saved by the signal handler in learn()
+        # Try to save final model if it wasn't saved yet
+        try:
+            if not os.path.exists(final_model_path):
+                mappo_controller.save(final_model_path)
+                print(f"✓ Final model saved on interruption to: {final_model_path}")
+        except Exception as e:
+            print(f"✗ Error saving on interruption: {e}")
+        
     except Exception as e:
         print(f"✗ Training failed with error: {e}")
         import traceback
         traceback.print_exc()
-        # Continue to save model even if training failed
-
-    # Save final model
-    final_model_path = os.path.join(filename, 'model_final.pt')
-    try:
-        mappo_controller.save(final_model_path)
-        print(f"✓ Final model saved to: {final_model_path}")
-    except Exception as e:
-        print(f"✗ Error saving final model: {e}")
+        # Try to save model even if training failed
+        try:
+            if hasattr(mappo_controller, 'total_steps') and mappo_controller.total_steps > 0:
+                error_model_path = os.path.join(filename, f'model_error_step_{mappo_controller.total_steps}.pt')
+                mappo_controller.save(error_model_path)
+                print(f"✓ Model saved after error to: {error_model_path}")
+                # Also try to save as final model
+                if not os.path.exists(final_model_path):
+                    mappo_controller.save(final_model_path)
+                    print(f"✓ Final model also saved to: {final_model_path}")
+        except Exception as save_error:
+            print(f"✗ Error saving model after failure: {save_error}")
+    
+    finally:
+        # Ensure environments are closed
+        try:
+            mappo_controller.close()
+        except:
+            pass
 
     ############################################################
     # Evaluation and Demonstration
@@ -270,13 +340,13 @@ def run(multiagent=DEFAULT_MA,
         multiagent=multiagent, 
         gui=gui, 
         record_video=record_video,
-        num_drones=DEFAULT_AGENTS if multiagent else 1
+        num_drones=num_drones if multiagent else 1
     )
 
     # Setup logger
     logger = Logger(
         logging_freq_hz=int(test_env.CTRL_FREQ),
-        num_drones=DEFAULT_AGENTS if multiagent else 1,
+        num_drones=num_drones if multiagent else 1,
         output_folder=output_folder,
         colab=colab,
         use_wandb=use_wandb,
@@ -358,7 +428,7 @@ def run(multiagent=DEFAULT_MA,
                             control=np.zeros(12)      # control signals
                         )
                     else:
-                        for d in range(min(DEFAULT_AGENTS, obs_flat.shape[0] if isinstance(obs_flat, np.ndarray) else 1)):
+                        for d in range(min(num_drones, obs_flat.shape[0] if isinstance(obs_flat, np.ndarray) else 1)):
                             drone_obs = obs_flat[d] if isinstance(obs_flat, np.ndarray) and len(obs_flat.shape) > 1 else obs_flat
                             logger.log(
                                 drone=d,
@@ -588,6 +658,9 @@ if __name__ == '__main__':
     parser.add_argument('--test_components',    default=False,                 type=str2bool,      help='Test MAPPO components before training (default: False)', metavar='')
     parser.add_argument('--test_env',           default=False,                 type=str2bool,      help='Test environment compatibility before training (default: False)', metavar='')
     parser.add_argument('--num_drones',         default=DEFAULT_AGENTS,        type=int,           help='Number of drones for multi-agent (default: 2)', metavar='')
+    parser.add_argument('--rollout_batch_size', default=8,                     type=int,           help='Number of parallel environments for vectorized training (default: 8)', metavar='')
+    parser.add_argument('--num_workers',        default=4,                     type=int,           help='Number of parallel processes for vectorized environments (default: 4)', metavar='')
+    parser.add_argument('--use_gpu',            default=True,                  type=str2bool,      help='Use GPU if available (default: True)', metavar='')
     
     ARGS = parser.parse_args()
     
@@ -615,7 +688,7 @@ if __name__ == '__main__':
     args_dict = vars(ARGS)
     args_dict.pop('test_components', None)
     args_dict.pop('test_env', None)
-    args_dict.pop('num_drones', None)
+    # Keep num_drones, rollout_batch_size, num_workers, use_gpu for run()
     
     # Run main training
     try:

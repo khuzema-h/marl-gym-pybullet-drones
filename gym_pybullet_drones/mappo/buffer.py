@@ -17,13 +17,17 @@ class MAPPOBuffer(object):
                  batch_size,
                  include_global_state=False,
                  global_state_dim=None,
-                 include_actions_in_critic=False
+                 include_actions_in_critic=False,
+                 device='cuda',
+                 use_gpu_storage=True
                  ):
         super().__init__()
         self.max_length = max_length
         self.batch_size = batch_size
         self.include_global_state = include_global_state
         self.include_actions_in_critic = include_actions_in_critic
+        self.device = device if torch.cuda.is_available() and use_gpu_storage else 'cpu'
+        self.use_gpu_storage = use_gpu_storage and torch.cuda.is_available()
         T, N = max_length, batch_size
         obs_shape = obs_space.shape
         act_shape = act_space.shape
@@ -138,8 +142,15 @@ class MAPPOBuffer(object):
             vshape = info['vshape']
             dtype = info.get('dtype', np.float32)
             init = info.get('init', np.zeros)
-            self.__dict__[k] = init(vshape).astype(dtype)
-            #print(f"[DEBUG] Buffer.reset - Allocated {k} with shape {vshape}, dtype {dtype}")
+            
+            if self.use_gpu_storage:
+                # Store directly on GPU as torch tensors
+                init_array = init(vshape).astype(dtype)
+                self.__dict__[k] = torch.from_numpy(init_array).to(self.device)
+            else:
+                # Store on CPU as numpy arrays (original behavior)
+                self.__dict__[k] = init(vshape).astype(dtype)
+            #print(f"[DEBUG] Buffer.reset - Allocated {k} with shape {vshape}, dtype {dtype}, device={self.device}")
         self.t = 0
         self.full = False
 
@@ -196,40 +207,66 @@ class MAPPOBuffer(object):
                 if v_.size > 0:
                     print(f"[ERROR] First element shape: {v_.flat[0].shape if hasattr(v_.flat[0], 'shape') else 'scalar'}")
                 raise e
-                
-            self.__dict__[k][self.t] = v_
+            
+            # Store on GPU if using GPU storage
+            if self.use_gpu_storage:
+                v_tensor = torch.from_numpy(v_).to(self.device)
+                self.__dict__[k][self.t] = v_tensor
+            else:
+                self.__dict__[k][self.t] = v_
         
         self.t = (self.t + 1) % self.max_length
         if self.t == 0:
             self.full = True
 
-    def get(self, device='cuda'):
+    def get(self, device=None):
         '''Returns all data as tensors.
         
         Args:
-            device: Device to place tensors on
+            device: Device to place tensors on (if None, uses buffer's device)
             
         Returns:
             batch: Dictionary of tensors with all data
         '''
+        if device is None:
+            device = self.device
         batch = {}
         for k, info in self.scheme.items():
             # Remove the time and batch dimensions for reshaping
             # Original shape: (T, N, ...) -> we want to flatten T and N
             shape = info['vshape'][2:]  # Remove T and N dimensions
-            data = self.__dict__[k].reshape(-1, *shape)
-            batch[k] = torch.as_tensor(data, device=device)
+            data = self.__dict__[k]
+            if isinstance(data, torch.Tensor):
+                # Already a tensor, just reshape and move to target device if needed
+                data = data.reshape(-1, *shape)
+                if data.device != device:
+                    data = data.to(device)
+            else:
+                # Numpy array, convert to tensor
+                data = data.reshape(-1, *shape)
+                data = torch.as_tensor(data, device=device)
+            batch[k] = data
         return batch
 
     def sample(self, indices):
         '''Returns partial data at given indices.
         
         Args:
-            indices: Array of indices to sample
+            indices: Array of indices to sample (can be numpy array or torch tensor)
             
         Returns:
-            batch: Dictionary of numpy arrays with sampled data
+            batch: Dictionary of arrays/tensors with sampled data
         '''
+        # Convert indices to appropriate type
+        if isinstance(self.__dict__[self.keys[0]], torch.Tensor):
+            # Using GPU storage, indices should be torch tensor
+            if isinstance(indices, np.ndarray):
+                indices = torch.from_numpy(indices).to(self.device)
+        else:
+            # Using CPU storage, indices should be numpy array
+            if isinstance(indices, torch.Tensor):
+                indices = indices.cpu().numpy()
+        
         batch = {}
         for k, info in self.scheme.items():
             shape = info['vshape'][2:]  # Remove T and N dimensions
@@ -238,17 +275,20 @@ class MAPPOBuffer(object):
             batch[k] = data
         return batch
 
-    def sampler(self, mini_batch_size, device='cuda', drop_last=True):
+    def sampler(self, mini_batch_size, device=None, drop_last=True):
         '''Makes sampler to loop through all data.
         
         Args:
             mini_batch_size: Size of each mini-batch
-            device: Device to place tensors on
+            device: Device to place tensors on (if None, uses buffer's device)
             drop_last: Whether to drop the last incomplete batch
             
         Yields:
             batch: Dictionary of tensors for each mini-batch
         '''
+        if device is None:
+            device = self.device
+        
         total_steps = self.max_length * self.batch_size
         if self.full:
             total_steps = self.max_length * self.batch_size
@@ -258,8 +298,10 @@ class MAPPOBuffer(object):
         sampler = random_sample(np.arange(total_steps), mini_batch_size, drop_last)
         for indices in sampler:
             batch = self.sample(indices)
+            # Ensure all items are tensors on the correct device
             batch = {
-                k: torch.as_tensor(v, device=device) for k, v in batch.items()
+                k: (v.to(device) if isinstance(v, torch.Tensor) else torch.as_tensor(v, device=device))
+                for k, v in batch.items()
             }
             yield batch
 
@@ -287,41 +329,65 @@ class MAPPOBuffer(object):
         '''Compute returns and advantages for all agents.
         
         Args:
-            last_val: Last value estimates for computing returns
+            last_val: Last value estimates for computing returns (can be numpy or torch tensor)
             gamma: Discount factor
             use_gae: Whether to use Generalized Advantage Estimation
             gae_lambda: GAE lambda parameter
             
         Returns:
-            rets: Computed returns
-            advs: Computed advantages
+            rets: Computed returns (same type as buffer storage)
+            advs: Computed advantages (same type as buffer storage)
         '''
         # Get rewards, values, and masks
         rews = self.rew
         vals = self.v
         masks = self.mask
         
+        # Convert to numpy for computation if using GPU storage (compute_returns_and_advantages uses numpy)
+        # We'll convert back to GPU tensors after computation
+        if self.use_gpu_storage:
+            rews_np = rews.cpu().numpy()
+            vals_np = vals.cpu().numpy()
+            masks_np = masks.cpu().numpy()
+            terminal_vals_np = self.terminal_v.cpu().numpy()
+            if isinstance(last_val, torch.Tensor):
+                last_val_np = last_val.cpu().numpy()
+            else:
+                last_val_np = last_val
+        else:
+            rews_np = rews
+            vals_np = vals
+            masks_np = masks
+            terminal_vals_np = self.terminal_v
+            last_val_np = last_val
+        
         # Determine if we're in multi-agent mode
-        if rews.ndim == 4:
+        if rews_np.ndim == 4:
             # Multi-agent: (T, N, num_agents, 1)
-            T, N, num_agents, _ = rews.shape
-            terminal_vals = self.terminal_v
+            T, N, num_agents, _ = rews_np.shape
             
             # Compute returns and advantages
-            rets, advs = compute_returns_and_advantages(
-                rews, vals, masks, terminal_vals, last_val,
+            rets_np, advs_np = compute_returns_and_advantages(
+                rews_np, vals_np, masks_np, terminal_vals_np, last_val_np,
                 gamma=gamma, use_gae=use_gae, gae_lambda=gae_lambda
             )
         else:
             # Single-agent: (T, N, 1)
-            T, N, _ = rews.shape
-            terminal_vals = self.terminal_v
+            T, N, _ = rews_np.shape
             
             # Compute returns and advantages
-            rets, advs = compute_returns_and_advantages(
-                rews, vals, masks, terminal_vals, last_val,
+            rets_np, advs_np = compute_returns_and_advantages(
+                rews_np, vals_np, masks_np, terminal_vals_np, last_val_np,
                 gamma=gamma, use_gae=use_gae, gae_lambda=gae_lambda
             )
+        
+        # Convert back to GPU tensors if using GPU storage
+        if self.use_gpu_storage:
+            rets = torch.from_numpy(rets_np).to(self.device)
+            advs = torch.from_numpy(advs_np).to(self.device)
+        else:
+            rets = rets_np
+            advs = advs_np
         
         # Store in buffer
         self.ret = rets
@@ -601,23 +667,32 @@ def normalize_advantages(advs, epsilon=1e-8):
     '''Normalize advantages to zero mean and unit variance.
     
     Args:
-        advs: Advantages array
+        advs: Advantages array (numpy or torch tensor)
         epsilon: Small constant to avoid division by zero
         
     Returns:
-        Normalized advantages
+        Normalized advantages (same type as input)
     '''
-    if advs.size == 0:
-        return advs
-    
-    adv_mean = advs.mean()
-    adv_std = advs.std()
-    
-    # Avoid division by zero
-    if adv_std < epsilon:
-        return advs - adv_mean
+    if isinstance(advs, torch.Tensor):
+        # GPU tensor
+        if advs.numel() == 0:
+            return advs
+        adv_mean = advs.mean()
+        adv_std = advs.std()
+        if adv_std < epsilon:
+            return advs - adv_mean
+        else:
+            return (advs - adv_mean) / (adv_std + epsilon)
     else:
-        return (advs - adv_mean) / (adv_std + epsilon)
+        # Numpy array
+        if advs.size == 0:
+            return advs
+        adv_mean = advs.mean()
+        adv_std = advs.std()
+        if adv_std < epsilon:
+            return advs - adv_mean
+        else:
+            return (advs - adv_mean) / (adv_std + epsilon)
 
 
 def compute_gae_advantages(td_errors, masks, gamma, gae_lambda):

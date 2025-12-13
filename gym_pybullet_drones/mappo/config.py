@@ -2,9 +2,9 @@
 
 MAPPO_CONFIG = {
     # Model args
-    'hidden_dim': 256,
+    'hidden_dim': 64,
     'activation': 'tanh',
-    'norm_obs': True,
+    'norm_obs': False,
     'norm_reward': False,
     'clip_obs': 10,
     'clip_reward': 10,
@@ -31,9 +31,9 @@ MAPPO_CONFIG = {
     'max_grad_norm': 0.5,
     
     # Runner args
-    'max_env_steps': 3000000,
-    'num_workers': 22,
-    'rollout_batch_size': 4, # 16, 32, 64
+    'max_env_steps': 1000000,
+    'num_workers': 16,
+    'rollout_batch_size': 4,
     'rollout_steps': 100,
     'deque_size': 10,
     'eval_batch_size': 10,

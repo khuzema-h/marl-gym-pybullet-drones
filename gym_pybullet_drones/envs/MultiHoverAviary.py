@@ -69,7 +69,8 @@ class MultiHoverAviary(BaseRLAviary):
                          obs=obs,
                          act=act
                          )
-        self.TARGET_POS = self.INIT_XYZS + np.array([[0,0,1/(i+1)] for i in range(num_drones)])
+        self.TARGET_POS = self.INIT_XYZS
+        # + np.array([[0,0,1/(i+1)] for i in range(num_drones)])
 
     ################################################################################
     

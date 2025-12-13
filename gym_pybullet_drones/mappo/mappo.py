@@ -37,9 +37,28 @@ class MAPPO(BaseController):
 
         # Task.
         if self.training:
-            # Use single environment instead of vectorized for now
-            self.env = env_func(seed=seed)
-            self.env = RecordEpisodeStatistics(self.env, self.deque_size)
+            # Use vectorized environments for parallel rollouts
+            rollout_batch_size = getattr(self, 'rollout_batch_size', 1)
+            num_workers = getattr(self, 'num_workers', 1)
+            
+            # Create vectorized training environment
+            if rollout_batch_size > 1:
+                self.env = make_vec_envs(
+                    env_func=env_func,
+                    env_configs=None,
+                    batch_size=rollout_batch_size,
+                    n_processes=num_workers,
+                    seed=seed
+                )
+                self.env = VecRecordEpisodeStatistics(self.env, self.deque_size)
+                print(f"[DEBUG] Using vectorized environment with {rollout_batch_size} parallel envs and {num_workers} workers")
+            else:
+                # Fallback to single environment
+                self.env = env_func(seed=seed)
+                self.env = RecordEpisodeStatistics(self.env, self.deque_size)
+                print(f"[DEBUG] Using single environment")
+            
+            # Evaluation environment (single env for now)
             self.eval_env = env_func(seed=seed * 111)
             self.eval_env = RecordEpisodeStatistics(self.eval_env, self.deque_size)
         else:
@@ -50,7 +69,16 @@ class MAPPO(BaseController):
         print(f"[DEBUG] Environment observation space: {self.env.observation_space}")
         print(f"[DEBUG] Environment action space: {self.env.action_space}")
         
+        # Check if vectorized environment
+        self.is_vectorized = hasattr(self.env, 'num_envs')
+        if self.is_vectorized:
+            self.num_envs = self.env.num_envs
+            print(f"[DEBUG] Vectorized environment with {self.num_envs} parallel environments")
+        else:
+            self.num_envs = 1
+        
         # Parse observation space to determine if multi-agent
+        # For vectorized envs, observation_space is the base env's space
         obs_shape = self.env.observation_space.shape
         if len(obs_shape) == 1:
             # Single agent or global state
@@ -119,13 +147,20 @@ class MAPPO(BaseController):
         '''Do initializations for training or evaluation.'''
         if self.training:
             # set up stats tracking
-            self.env.add_tracker('constraint_violation', 0)
-            self.env.add_tracker('constraint_violation', 0, mode='queue')
+            if self.is_vectorized:
+                # Vectorized envs handle tracking differently
+                pass  # VecRecordEpisodeStatistics handles this automatically
+            else:
+                self.env.add_tracker('constraint_violation', 0)
+                self.env.add_tracker('constraint_violation', 0, mode='queue')
             self.eval_env.add_tracker('constraint_violation', 0, mode='queue')
             self.eval_env.add_tracker('mse', 0, mode='queue')
 
             self.total_steps = 0
-            obs, _ = self.env.reset()
+            obs, info = self.env.reset()
+            # Handle vectorized env reset - info is a dict with 'n' key
+            if isinstance(info, dict) and 'n' in info:
+                info = info['n'][0] if len(info['n']) > 0 else {}
             self.obs = self.obs_normalizer(obs)
             self.episode_return = 0
             self.episode_length = 0
@@ -137,10 +172,32 @@ class MAPPO(BaseController):
 
     def close(self):
         '''Shuts down and cleans up lingering resources.'''
-        self.env.close()
+        # Close training environment (handle broken pipes from dead workers)
+        try:
+            if hasattr(self, 'env') and self.env is not None:
+                self.env.close()
+        except (BrokenPipeError, ConnectionResetError, AttributeError, RuntimeError, OSError):
+            # Workers might already be dead, that's okay
+            pass
+        except Exception as e:
+            print(f"⚠ Warning: Error closing training environment: {e}")
+        
+        # Close evaluation environment
         if self.training:
-            self.eval_env.close()
-        self.logger.close()
+            try:
+                if hasattr(self, 'eval_env') and self.eval_env is not None:
+                    self.eval_env.close()
+            except (BrokenPipeError, ConnectionResetError, AttributeError, RuntimeError, OSError):
+                pass
+            except Exception as e:
+                print(f"⚠ Warning: Error closing evaluation environment: {e}")
+        
+        # Close logger
+        try:
+            if hasattr(self, 'logger') and self.logger is not None:
+                self.logger.close()
+        except Exception as e:
+            print(f"⚠ Warning: Error closing logger: {e}")
 
     def save(self, path):
         '''Saves model params and experiment state to checkpoint path.'''
@@ -152,11 +209,20 @@ class MAPPO(BaseController):
             'reward_normalizer': self.reward_normalizer.state_dict(),
         }
         if self.training:
+            # Try to get env random state, but don't fail if env is closed
+            env_random_state = None
+            try:
+                if hasattr(self.env, 'get_env_random_state'):
+                    env_random_state = self.env.get_env_random_state()
+            except (BrokenPipeError, ConnectionResetError, AttributeError, RuntimeError):
+                # Environment might be closed or workers dead, skip env_random_state
+                pass
+            
             exp_state = {
                 'total_steps': self.total_steps,
                 'obs': self.obs,
                 'random_state': get_random_state(),
-                'env_random_state': self.env.get_env_random_state() if hasattr(self.env, 'get_env_random_state') else None
+                'env_random_state': env_random_state
             }
             state_dict.update(exp_state)
         torch.save(state_dict, path)
@@ -174,9 +240,33 @@ class MAPPO(BaseController):
         if self.training:
             self.total_steps = state['total_steps']
             self.obs = state['obs']
-            set_random_state(state['random_state'])
+            
+            # Restore random state with error handling
+            if 'random_state' in state:
+                try:
+                    random_state = state['random_state']
+                    # Fix torch RNG state if it's not a ByteTensor
+                    if 'torch' in random_state:
+                        torch_state = random_state['torch']
+                        if not isinstance(torch_state, torch.ByteTensor):
+                            # Try to convert to ByteTensor
+                            if isinstance(torch_state, torch.Tensor):
+                                random_state['torch'] = torch_state.byte()
+                            else:
+                                # If it's not a tensor, skip torch RNG state restoration
+                                print("⚠ Warning: Torch RNG state format invalid, skipping restoration")
+                                random_state.pop('torch', None)
+                    
+                    set_random_state(random_state)
+                except Exception as e:
+                    print(f"⚠ Warning: Could not restore random state: {e}")
+                    print("   Continuing without RNG state restoration...")
+            
             if state.get('env_random_state') is not None and hasattr(self.env, 'set_env_random_state'):
-                self.env.set_env_random_state(state['env_random_state'])
+                try:
+                    self.env.set_env_random_state(state['env_random_state'])
+                except Exception as e:
+                    print(f"⚠ Warning: Could not restore environment random state: {e}")
                 
     def select_action(self, obs, info=None):
         '''Determine the action to take at the current timestep.
@@ -205,6 +295,55 @@ class MAPPO(BaseController):
         except ImportError:
             TQDM_AVAILABLE = False
             print("tqdm not available, continuing without progress bar...")
+        
+        # Set up signal handler for graceful interruption
+        import signal
+        self._interrupt_handled = False  # Flag to prevent multiple saves
+        
+        def signal_handler(sig, frame):
+            # Prevent multiple interrupt handlers from running
+            if getattr(self, '_interrupt_handled', False):
+                return
+            self._interrupt_handled = True
+            
+            print("\n⚠ Training interrupted! Saving latest model...")
+            
+            # Save BEFORE closing environments to avoid broken pipes
+            try:
+                if hasattr(self, 'total_steps') and self.total_steps > 0:
+                    # Save to checkpoint path
+                    try:
+                        self.save(self.checkpoint_path)
+                        print(f"✓ Latest model saved to: {self.checkpoint_path}")
+                    except Exception as e:
+                        print(f"✗ Error saving checkpoint: {e}")
+                    
+                    # Save to interrupt-specific path
+                    try:
+                        interrupt_path = os.path.join(self.output_dir, f'model_interrupted_step_{self.total_steps}.pt')
+                        self.save(interrupt_path)
+                        print(f"✓ Interrupted checkpoint saved to: {interrupt_path}")
+                    except Exception as e:
+                        print(f"✗ Error saving interrupt checkpoint: {e}")
+            except Exception as e:
+                print(f"✗ Error during save on interruption: {e}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                # Close environments AFTER saving (but don't fail if already closed)
+                try:
+                    self.close()
+                except (BrokenPipeError, ConnectionResetError, AttributeError, RuntimeError):
+                    # Workers might already be dead, that's okay
+                    pass
+                except Exception as e:
+                    print(f"⚠ Warning: Error closing environments: {e}")
+            
+            # Raise KeyboardInterrupt to exit the training loop
+            raise KeyboardInterrupt
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
 
         # Print training header
         print(f"\n{'='*60}")
@@ -231,102 +370,144 @@ class MAPPO(BaseController):
             interval_save = np.zeros_like(step_interval, dtype=bool)
             
         # Training loop
-        while self.total_steps < self.max_env_steps:
-            results = self.train_step()
-            
-            # Update progress bar
-            if TQDM_AVAILABLE:
-                pbar.update(self.rollout_steps)
-                # Update progress bar description with current stats
+        try:
+            while self.total_steps < self.max_env_steps:
+                results = self.train_step()
+                
+                # Update progress bar
+                if TQDM_AVAILABLE:
+                    pbar.update(self.rollout_steps * self.num_envs if self.is_vectorized else self.rollout_steps)
+                    # Update progress bar description with current stats
+                    if self.total_steps % self.log_interval == 0:
+                        ep_returns = np.asarray(self.env.return_queue)
+                        if len(ep_returns) > 0:
+                            mean_return = ep_returns.mean()
+                            pbar.set_description(f"MAPPO (Return: {mean_return:.1f})")
+
+                # === LIVE TERMINAL LOGGING ===
                 if self.total_steps % self.log_interval == 0:
+                    # Get current stats
+                    ep_lengths = np.asarray(self.env.length_queue)
                     ep_returns = np.asarray(self.env.return_queue)
+                    
                     if len(ep_returns) > 0:
                         mean_return = ep_returns.mean()
-                        pbar.set_description(f"MAPPO (Return: {mean_return:.1f})")
-
-            # === LIVE TERMINAL LOGGING ===
-            if self.total_steps % self.log_interval == 0:
-                # Get current stats
-                ep_lengths = np.asarray(self.env.length_queue)
-                ep_returns = np.asarray(self.env.return_queue)
-                
-                if len(ep_returns) > 0:
-                    mean_return = ep_returns.mean()
-                    mean_length = ep_lengths.mean()
-                else:
-                    mean_return = 0
-                    mean_length = 0
+                        mean_length = ep_lengths.mean()
+                    else:
+                        mean_return = 0
+                        mean_length = 0
+                        
+                    # Get loss values
+                    policy_loss = results.get('policy_loss', 0)
+                    value_loss = results.get('value_loss', 0)
+                    entropy_loss = results.get('entropy_loss', 0)
+                    approx_kl = results.get('approx_kl', 0)
                     
-                # Get loss values
-                policy_loss = results.get('policy_loss', 0)
-                value_loss = results.get('value_loss', 0)
-                entropy_loss = results.get('entropy_loss', 0)
-                approx_kl = results.get('approx_kl', 0)
-                
-                # Print to terminal
-                print(f"{'Step':>8} {'Return':>12} {'Length':>8} {'Value Loss':>12} {'Policy Loss':>12} {'Entropy':>10} {'KL':>8}")
-                print("-" * 80)
-                print(f"{self.total_steps:8d} {mean_return:12.2f} {mean_length:8.1f} "
-                    f"{value_loss:12.4f} {policy_loss:12.4f} {entropy_loss:10.4f} {approx_kl:8.4f}")
-                print("-" * 80)
+                    # Print to terminal
+                    print(f"{'Step':>8} {'Return':>12} {'Length':>8} {'Value Loss':>12} {'Policy Loss':>12} {'Entropy':>10} {'KL':>8}")
+                    print("-" * 80)
+                    print(f"{self.total_steps:8d} {mean_return:12.2f} {mean_length:8.1f} "
+                        f"{value_loss:12.4f} {policy_loss:12.4f} {entropy_loss:10.4f} {approx_kl:8.4f}")
+                    print("-" * 80)
 
-            # Checkpoint.
-            if self.total_steps >= self.max_env_steps or (self.save_interval and self.total_steps % self.save_interval == 0):
-                # Latest/final checkpoint.
-                self.save(self.checkpoint_path)
-                self.logger.info(f'Checkpoint | {self.checkpoint_path}')
-                path = os.path.join(self.output_dir, 'checkpoints', 'model_{}.pt'.format(self.total_steps))
-                self.save(path)
-                if self.total_steps % self.log_interval == 0:
-                    print(f"💾 Checkpoint saved at step {self.total_steps}")
-                    
-            if self.num_checkpoints > 0:
-                interval_id = np.argmin(np.abs(np.array(step_interval) - self.total_steps))
-                if interval_save[interval_id] is False:
-                    # Intermediate checkpoint.
-                    path = os.path.join(self.output_dir, 'checkpoints', f'model_{self.total_steps}.pt')
+                # Checkpoint.
+                # Save at regular intervals OR if this is the first checkpoint (to ensure we always have at least one)
+                # Also save more frequently early on for safety
+                early_save_interval = getattr(self, 'early_save_interval', None)
+                should_save = (
+                    self.total_steps >= self.max_env_steps or 
+                    (self.save_interval and self.total_steps % self.save_interval == 0) or
+                    (early_save_interval and self.total_steps > 0 and self.total_steps % early_save_interval == 0) or
+                    (self.total_steps > 0 and not hasattr(self, '_first_checkpoint_saved'))
+                )
+                
+                if should_save:
+                    # Latest/final checkpoint.
+                    self.save(self.checkpoint_path)
+                    self.logger.info(f'Checkpoint | {self.checkpoint_path}')
+                    path = os.path.join(self.output_dir, 'checkpoints', 'model_{}.pt'.format(self.total_steps))
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
                     self.save(path)
-                    interval_save[interval_id] = True
+                    self._first_checkpoint_saved = True
+                    if self.total_steps % self.log_interval == 0:
+                        print(f"💾 Checkpoint saved at step {self.total_steps}")
+                        
+                if self.num_checkpoints > 0:
+                    interval_id = np.argmin(np.abs(np.array(step_interval) - self.total_steps))
+                    if interval_save[interval_id] is False:
+                        # Intermediate checkpoint.
+                        path = os.path.join(self.output_dir, 'checkpoints', f'model_{self.total_steps}.pt')
+                        self.save(path)
+                        interval_save[interval_id] = True
+                        
+                # Evaluation.
+                if self.eval_interval and self.total_steps % self.eval_interval == 0:
+                    eval_results = self.run(env=self.eval_env, n_episodes=self.eval_batch_size)
+                    results['eval'] = eval_results
                     
-            # Evaluation.
-            if self.eval_interval and self.total_steps % self.eval_interval == 0:
-                eval_results = self.run(env=self.eval_env, n_episodes=self.eval_batch_size)
-                results['eval'] = eval_results
-                
-                # Print evaluation results to terminal
-                eval_return = eval_results['ep_returns'].mean()
-                eval_std = eval_results['ep_returns'].std()
-                eval_length = eval_results['ep_lengths'].mean()
-                
-                print(f"\n⭐ [EVAL] Step {self.total_steps}:")
-                print(f"   Return: {eval_return:.2f} +/- {eval_std:.2f}")
-                print(f"   Length: {eval_length:.1f}")
-                
-                # Color code evaluation results based on performance
-                if eval_return > 0:
-                    print(f"   🎉 Good progress!")
-                elif eval_return > -100:
-                    print(f"   📊 Learning...")
-                else:
-                    print(f"   🔄 Needs improvement...")
-                
-                self.logger.info('Eval | ep_lengths {:.2f} +/- {:.2f} | ep_return {:.3f} +/- {:.3f}'.format(
-                    eval_results['ep_lengths'].mean(),
-                    eval_results['ep_lengths'].std(),
-                    eval_results['ep_returns'].mean(), 
-                    eval_results['ep_returns'].std()))
+                    # Print evaluation results to terminal
+                    eval_return = eval_results['ep_returns'].mean()
+                    eval_std = eval_results['ep_returns'].std()
+                    eval_length = eval_results['ep_lengths'].mean()
                     
-                # Save best model.
-                eval_score = eval_results['ep_returns'].mean()
-                eval_best_score = getattr(self, 'eval_best_score', -np.inf)
-                if self.eval_save_best and eval_best_score < eval_score:
-                    self.eval_best_score = eval_score
-                    self.save(os.path.join(self.output_dir, 'model_best.pt'))
-                    print(f"   🏆 New best model! Score: {eval_score:.2f} (saved)")
+                    print(f"\n⭐ [EVAL] Step {self.total_steps}:")
+                    print(f"   Return: {eval_return:.2f} +/- {eval_std:.2f}")
+                    print(f"   Length: {eval_length:.1f}")
                     
-            # Logging to files/tensorboard.
-            if self.log_interval and self.total_steps % self.log_interval == 0:
-                self.log_step(results)
+                    # Color code evaluation results based on performance
+                    if eval_return > 0:
+                        print(f"   🎉 Good progress!")
+                    elif eval_return > -100:
+                        print(f"   📊 Learning...")
+                    else:
+                        print(f"   🔄 Needs improvement...")
+                    
+                    self.logger.info('Eval | ep_lengths {:.2f} +/- {:.2f} | ep_return {:.3f} +/- {:.3f}'.format(
+                        eval_results['ep_lengths'].mean(),
+                        eval_results['ep_lengths'].std(),
+                        eval_results['ep_returns'].mean(), 
+                        eval_results['ep_returns'].std()))
+                        
+                    # Save best model.
+                    eval_score = eval_results['ep_returns'].mean()
+                    eval_best_score = getattr(self, 'eval_best_score', -np.inf)
+                    if self.eval_save_best and eval_best_score < eval_score:
+                        self.eval_best_score = eval_score
+                        self.save(os.path.join(self.output_dir, 'model_best.pt'))
+                        print(f"   🏆 New best model! Score: {eval_score:.2f} (saved)")
+                        
+                # Logging to files/tensorboard.
+                if self.log_interval and self.total_steps % self.log_interval == 0:
+                    self.log_step(results)
+        
+        except KeyboardInterrupt:
+            # Handle interruption gracefully (signal handler should have already saved)
+            # But save again here as a backup if signal handler didn't run
+            if not getattr(self, '_interrupt_handled', False):
+                print("\n⚠ Training interrupted! Saving latest model...")
+                if hasattr(self, 'total_steps') and self.total_steps > 0:
+                    try:
+                        self.save(self.checkpoint_path)
+                        interrupt_path = os.path.join(self.output_dir, f'model_interrupted_step_{self.total_steps}.pt')
+                        self.save(interrupt_path)
+                        print(f"✓ Latest model saved to: {self.checkpoint_path}")
+                        print(f"✓ Interrupted checkpoint saved to: {interrupt_path}")
+                    except Exception as e:
+                        print(f"✗ Error saving on interruption: {e}")
+                        import traceback
+                        traceback.print_exc()
+            else:
+                print("⚠ Training interrupted! (Model already saved by signal handler)")
+            
+            # Close environments if not already closed
+            try:
+                self.close()
+            except (BrokenPipeError, ConnectionResetError, AttributeError, RuntimeError):
+                pass  # Already closed or workers dead
+            except Exception as e:
+                print(f"⚠ Warning: Error closing environments: {e}")
+            
+            raise  # Re-raise to exit properly
 
         # Training completed
         if TQDM_AVAILABLE:
@@ -440,30 +621,92 @@ class MAPPO(BaseController):
         self.obs_normalizer.unset_read_only()
         
         # Initialize buffer with global state support for centralized critic
+        # Use num_envs for batch_size if vectorized
+        batch_size = self.num_envs if self.is_vectorized else 1
         rollouts = MAPPOBuffer(
             self.env.observation_space,
             self.env.action_space,
             self.rollout_steps,
-            batch_size=1,
+            batch_size=batch_size,
             include_global_state=self.centralized_critic,
             global_state_dim=self.global_state_dim,
-            include_actions_in_critic=self.include_actions_in_critic
+            include_actions_in_critic=self.include_actions_in_critic,
+            device=self.device,
+            use_gpu_storage=True  # Store buffer data on GPU to reduce CPU RAM usage
         )
         
         obs = self.obs
         start = time.time()
         
+        # Track step rewards for statistics
+        step_rewards = []
+        
         # Collect rollouts
         for step in range(self.rollout_steps):
             with torch.inference_mode():
                 # Get actions from decentralized actors
-                obs_tensor = torch.FloatTensor(obs).to(self.device)
-                act, v, logp = self.agent.ac.step(obs_tensor)
-            
-            # Debug: Check action shape
-            # print(f"[DEBUG] Step {step}: Action shape: {act.shape}, Action: {act}")
+                # Handle vectorized observations
+                if self.is_vectorized:
+                    # obs shape: (num_envs, ...) for vectorized
+                    # Batch all environments together for efficient GPU processing
+                    if isinstance(obs, np.ndarray) and obs.ndim > 2:
+                        # Multi-agent vectorized: (num_envs, num_agents, obs_dim)
+                        # Flatten to (num_envs * num_agents, obs_dim) for batched processing
+                        original_shape = obs.shape  # (num_envs, num_agents, obs_dim)
+                        batch_obs = obs.reshape(-1, obs.shape[-1])  # (num_envs * num_agents, obs_dim)
+                        obs_tensor = torch.FloatTensor(batch_obs).to(self.device)
+                        
+                        # Single batched forward pass on GPU
+                        act, v, logp = self.agent.ac.step(obs_tensor)
+                        
+                        # Convert to numpy
+                        if isinstance(act, torch.Tensor):
+                            act = act.cpu().numpy()
+                        if isinstance(v, torch.Tensor):
+                            v = v.cpu().numpy()
+                        if isinstance(logp, torch.Tensor):
+                            logp = logp.cpu().numpy()
+                        
+                        # Reshape back to (num_envs, num_agents, action_dim)
+                        act = act.reshape(original_shape[0], original_shape[1], -1)  # (num_envs, num_agents, action_dim)
+                        v = v.reshape(original_shape[0], original_shape[1], -1)  # (num_envs, num_agents, 1)
+                        logp = logp.reshape(original_shape[0], original_shape[1], -1)  # (num_envs, num_agents, 1)
+                    elif isinstance(obs, np.ndarray) and obs.ndim == 2:
+                        # Single-agent vectorized: (num_envs, obs_dim)
+                        obs_tensor = torch.FloatTensor(obs).to(self.device)
+                        act, v, logp = self.agent.ac.step(obs_tensor)
+                        # Convert to numpy
+                        if isinstance(act, torch.Tensor):
+                            act = act.cpu().numpy()
+                        if isinstance(v, torch.Tensor):
+                            v = v.cpu().numpy()
+                        if isinstance(logp, torch.Tensor):
+                            logp = logp.cpu().numpy()
+                    else:
+                        obs_tensor = torch.FloatTensor(obs).to(self.device)
+                        act, v, logp = self.agent.ac.step(obs_tensor)
+                        # Convert to numpy
+                        if isinstance(act, torch.Tensor):
+                            act = act.cpu().numpy()
+                        if isinstance(v, torch.Tensor):
+                            v = v.cpu().numpy()
+                        if isinstance(logp, torch.Tensor):
+                            logp = logp.cpu().numpy()
+                else:
+                    # Single environment
+                    obs_tensor = torch.FloatTensor(obs).to(self.device)
+                    act, v, logp = self.agent.ac.step(obs_tensor)
+                    # Convert to numpy
+                    if isinstance(act, torch.Tensor):
+                        act = act.cpu().numpy()
+                    if isinstance(v, torch.Tensor):
+                        v = v.cpu().numpy()
+                    if isinstance(logp, torch.Tensor):
+                        logp = logp.cpu().numpy()
             
             # Step environment
+            # For vectorized envs, actions should be array of shape (num_envs, num_agents, action_dim) for multi-agent
+            # or (num_envs, action_dim) for single-agent
             step_result = self.env.step(act)
             if len(step_result) == 5:
                 next_obs, rew, terminated, truncated, info = step_result
@@ -471,100 +714,277 @@ class MAPPO(BaseController):
             else:
                 next_obs, rew, done, info = step_result
 
-            # Ensure proper array shapes
-            if isinstance(done, (bool, np.bool_)):
-                done = np.array([done])
-            if isinstance(rew, (float, int)):
-                rew = np.array([rew])
+            # Handle vectorized environment outputs
+            if self.is_vectorized:
+                # Vectorized envs return arrays: rew shape (num_envs,), done shape (num_envs,)
+                # Ensure rew and done are numpy arrays with correct shape
+                if not isinstance(rew, np.ndarray):
+                    rew = np.array([rew] * self.num_envs)
+                if rew.ndim == 0:
+                    rew = np.array([rew] * self.num_envs)
+                elif rew.ndim == 1 and rew.shape[0] != self.num_envs:
+                    # Expand if needed
+                    rew = np.array([rew[0] if len(rew) > 0 else 0] * self.num_envs)
+                
+                if not isinstance(done, np.ndarray):
+                    done = np.array([done] * self.num_envs)
+                if done.ndim == 0:
+                    done = np.array([done] * self.num_envs)
+                elif done.ndim == 1 and done.shape[0] != self.num_envs:
+                    done = np.array([done[0] if len(done) > 0 else False] * self.num_envs)
+                
+                # For multi-agent, expand rewards to (num_envs, num_agents, 1)
+                if self.num_agents > 1:
+                    if rew.ndim == 1:
+                        # (num_envs,) -> (num_envs, num_agents, 1)
+                        rew = np.tile(rew[:, np.newaxis, np.newaxis], (1, self.num_agents, 1))
+                    elif rew.ndim == 2:
+                        if rew.shape[1] == 1:
+                            # (num_envs, 1) -> (num_envs, num_agents, 1)
+                            rew = np.tile(rew[:, np.newaxis, :], (1, self.num_agents, 1))
+                        else:
+                            # (num_envs, num_agents) -> (num_envs, num_agents, 1)
+                            rew = rew[:, :, np.newaxis]
+                    elif rew.ndim == 3 and rew.shape == (self.num_envs, 1, 1):
+                        # (num_envs, 1, 1) -> (num_envs, num_agents, 1)
+                        rew = np.tile(rew, (1, self.num_agents, 1))
+                else:
+                    # Single agent: (num_envs, 1)
+                    if rew.ndim == 1:
+                        rew = rew[:, np.newaxis]
+                    elif rew.ndim == 3 and rew.shape[2] == 1:
+                        rew = rew.squeeze(2)  # Remove last dimension if present
+            else:
+                # Single environment
+                if isinstance(done, (bool, np.bool_)):
+                    done = np.array([done])
+                if isinstance(rew, (float, int)):
+                    rew = np.array([rew])
 
+            # Track raw rewards before normalization for statistics
+            if self.is_vectorized:
+                # For vectorized, get mean reward across all environments
+                if isinstance(rew, np.ndarray):
+                    if rew.ndim >= 1:
+                        step_rewards.append(rew.mean() if rew.size > 0 else 0)
+                    else:
+                        step_rewards.append(float(rew))
+                else:
+                    step_rewards.append(float(rew))
+            else:
+                # Single environment
+                if isinstance(rew, np.ndarray):
+                    step_rewards.append(rew.mean() if rew.size > 0 else float(rew))
+                else:
+                    step_rewards.append(float(rew))
+            
             # Normalize observations and rewards
             next_obs = self.obs_normalizer(next_obs)
             rew = self.reward_normalizer(rew, done)
-            mask = 1 - done.astype(float)
+            
+            # Create mask for vectorized environments
+            if self.is_vectorized:
+                # done is (num_envs,), mask should be (num_envs, num_agents, 1) for multi-agent
+                mask = 1 - done.astype(float)  # (num_envs,)
+                if self.num_agents > 1:
+                    # Expand to (num_envs, num_agents, 1)
+                    mask = np.tile(mask[:, np.newaxis, np.newaxis], (1, self.num_agents, 1))
+                else:
+                    mask = mask[:, np.newaxis]  # (num_envs, 1)
+            else:
+                mask = 1 - done.astype(float)
 
             # Get value estimate for time truncation handling
-            terminal_v = np.zeros_like(v)
-            if 'terminal_info' in info and info['terminal_info'].get('TimeLimit.truncated', False):
-                terminal_obs = info['terminal_observation']
-                terminal_obs_tensor = torch.FloatTensor(terminal_obs).to(self.device)
-                # Get terminal value from critic
-                if self.centralized_critic:
-                    terminal_global_obs = self._get_global_observation(terminal_obs)
-                    terminal_global_obs_tensor = torch.FloatTensor(terminal_global_obs).to(self.device).unsqueeze(0)
-                    terminal_val = self.agent.ac.get_value(terminal_global_obs_tensor).detach().cpu().numpy()
-                else:
-                    terminal_val = self.agent.ac.get_value(terminal_obs_tensor, agent_idx=0).detach().cpu().numpy()
-                terminal_v = terminal_val
+            # For vectorized envs, handle terminal info differently
+            if self.is_vectorized:
+                # Vectorized envs return info as {'n': [info1, info2, ...]}
+                terminal_v = np.zeros_like(v)
+                if isinstance(info, dict) and 'n' in info:
+                    # Check each env's info for terminal observations
+                    for env_idx, env_info in enumerate(info['n']):
+                        if 'terminal_info' in env_info and env_info['terminal_info'].get('TimeLimit.truncated', False):
+                            terminal_obs = env_info.get('terminal_observation', next_obs[env_idx])
+                            terminal_obs_tensor = torch.FloatTensor(terminal_obs).to(self.device)
+                            # Get terminal value from critic
+                            if self.centralized_critic:
+                                terminal_global_obs = self._get_global_observation(terminal_obs)
+                                terminal_global_obs_tensor = torch.FloatTensor(terminal_global_obs).to(self.device).unsqueeze(0)
+                                terminal_val = self.agent.ac.get_value(terminal_global_obs_tensor).detach().cpu().numpy()
+                            else:
+                                terminal_val = self.agent.ac.get_value(terminal_obs_tensor, agent_idx=0).detach().cpu().numpy()
+                            # Set terminal_v for this environment
+                            if self.num_agents > 1:
+                                terminal_v[env_idx] = terminal_val if isinstance(terminal_val, np.ndarray) else np.full((self.num_agents, 1), terminal_val)
+                            else:
+                                terminal_v[env_idx] = terminal_val if isinstance(terminal_val, (int, float)) else terminal_val[0]
+            else:
+                # Single environment
+                terminal_v = np.zeros_like(v)
+                if 'terminal_info' in info and info['terminal_info'].get('TimeLimit.truncated', False):
+                    terminal_obs = info['terminal_observation']
+                    terminal_obs_tensor = torch.FloatTensor(terminal_obs).to(self.device)
+                    # Get terminal value from critic
+                    if self.centralized_critic:
+                        terminal_global_obs = self._get_global_observation(terminal_obs)
+                        terminal_global_obs_tensor = torch.FloatTensor(terminal_global_obs).to(self.device).unsqueeze(0)
+                        terminal_val = self.agent.ac.get_value(terminal_global_obs_tensor).detach().cpu().numpy()
+                    else:
+                        terminal_val = self.agent.ac.get_value(terminal_obs_tensor, agent_idx=0).detach().cpu().numpy()
+                    terminal_v = terminal_val
 
             # Get global observation for centralized critic
             global_obs = None
             if self.centralized_critic:
-                global_obs = self._get_global_observation(obs)
+                if self.is_vectorized:
+                    # For vectorized envs, get global obs for each environment
+                    global_obs = np.array([self._get_global_observation(obs[i]) for i in range(self.num_envs)])
+                else:
+                    global_obs = self._get_global_observation(obs)
 
-            # Fix shapes based on single vs multi-agent
-            is_multi_agent = len(obs.shape) > 1 and obs.shape[0] > 1
-            if is_multi_agent:
-                num_agents = obs.shape[0]
+            # Fix shapes based on single vs multi-agent and vectorized vs single
+            if self.is_vectorized:
+                # Vectorized: obs shape is (num_envs, num_agents, obs_dim) or (num_envs, obs_dim)
+                if len(obs.shape) > 2 and obs.shape[1] > 1:
+                    is_multi_agent = True
+                    num_agents_per_env = obs.shape[1]
+                elif len(obs.shape) == 2:
+                    is_multi_agent = False
+                    num_agents_per_env = 1
+                else:
+                    is_multi_agent = False
+                    num_agents_per_env = 1
                 
-                # Ensure rewards and masks have correct shape for multi-agent
-                if rew.shape == (1,) or (rew.ndim == 1 and rew.shape[0] == 1):
-                    rew = np.full((num_agents, 1), rew[0])  # Expand to (num_agents, 1)
-                elif rew.ndim == 2 and rew.shape[0] != num_agents:
-                    rew = np.full((num_agents, 1), rew[0, 0] if rew.shape[0] > 0 else rew[0])
-                
-                if mask.shape == (1,) or (mask.ndim == 1 and mask.shape[0] == 1):
-                    mask = np.full((num_agents, 1), mask[0])  # Expand to (num_agents, 1)
-                elif mask.ndim == 2 and mask.shape[0] != num_agents:
-                    mask = np.full((num_agents, 1), mask[0, 0] if mask.shape[0] > 0 else mask[0])
-                
-                # Remove extra dimension from v and logp if needed
-                if v.ndim == 3 and v.shape[-1] == 1:
-                    v = v.reshape(num_agents, 1)
-                elif v.ndim == 2 and v.shape[0] != num_agents:
-                    v = np.full((num_agents, 1), v[0, 0] if v.shape[0] > 0 else v[0])
+                # For vectorized, ensure shapes are correct:
+                # - Multi-agent: (num_envs, num_agents, ...)
+                # - Single-agent: (num_envs, ...)
+                # Buffer expects (N, ...) where N = num_envs
+                if is_multi_agent:
+                    # Ensure rew, mask, v, logp have shape (num_envs, num_agents, 1)
+                    # Rewards from environment are per-environment, need to expand to per-agent
+                    if rew.ndim == 3 and rew.shape == (self.num_envs, 1, 1):
+                        # (num_envs, 1, 1) -> expand to (num_envs, num_agents, 1)
+                        rew = np.tile(rew, (1, num_agents_per_env, 1))
+                    elif rew.ndim == 2 and rew.shape == (self.num_envs, 1):
+                        # (num_envs, 1) -> expand to (num_envs, num_agents, 1)
+                        rew = np.tile(rew[:, np.newaxis, :], (1, num_agents_per_env, 1))
+                    elif rew.ndim == 1 and rew.shape[0] == self.num_envs:
+                        # (num_envs,) -> expand to (num_envs, num_agents, 1)
+                        rew = np.tile(rew[:, np.newaxis, np.newaxis], (1, num_agents_per_env, 1))
+                    elif rew.ndim == 0 or (rew.ndim == 1 and rew.shape[0] == 1):
+                        # Scalar or single value -> expand to (num_envs, num_agents, 1)
+                        rew = np.full((self.num_envs, num_agents_per_env, 1), float(rew))
                     
-                if logp.ndim == 3 and logp.shape[-1] == 1:
-                    logp = logp.reshape(num_agents, 1)
-                elif logp.ndim == 2 and logp.shape[0] != num_agents:
-                    logp = np.full((num_agents, 1), logp[0, 0] if logp.shape[0] > 0 else logp[0])
+                    if mask.ndim == 2 and mask.shape[0] == self.num_envs and mask.shape[1] == 1:
+                        mask = np.tile(mask[:, np.newaxis, :], (1, num_agents_per_env, 1))
+                    elif mask.ndim == 1 and mask.shape[0] == self.num_envs:
+                        mask = np.tile(mask[:, np.newaxis, np.newaxis], (1, num_agents_per_env, 1))
                     
-                # Ensure terminal_v has the right shape
-                if terminal_v.shape == () or terminal_v.size == 1:
-                    terminal_v = np.zeros((num_agents, 1))
-                elif terminal_v.ndim == 3 and terminal_v.shape[-1] == 1:
-                    terminal_v = terminal_v.reshape(num_agents, 1)
-                elif terminal_v.ndim == 2 and terminal_v.shape[0] != num_agents:
-                    terminal_v = np.zeros((num_agents, 1))
+                    # v and logp should already be (num_envs, num_agents, 1) from agent.step
+                    # But ensure they're correct
+                    if v.ndim == 2:
+                        if v.shape[0] == self.num_envs * num_agents_per_env:
+                            v = v.reshape(self.num_envs, num_agents_per_env, -1)
+                        elif v.shape[0] == self.num_envs:
+                            v = np.tile(v[:, np.newaxis, :], (1, num_agents_per_env, 1))
+                    elif v.ndim == 3 and (v.shape[0] != self.num_envs or v.shape[1] != num_agents_per_env):
+                        # Wrong shape, try to fix
+                        if v.shape[0] == self.num_envs * num_agents_per_env:
+                            v = v.reshape(self.num_envs, num_agents_per_env, -1)
+                    
+                    if logp.ndim == 2:
+                        if logp.shape[0] == self.num_envs * num_agents_per_env:
+                            logp = logp.reshape(self.num_envs, num_agents_per_env, -1)
+                        elif logp.shape[0] == self.num_envs:
+                            logp = np.tile(logp[:, np.newaxis, :], (1, num_agents_per_env, 1))
+                    elif logp.ndim == 3 and (logp.shape[0] != self.num_envs or logp.shape[1] != num_agents_per_env):
+                        if logp.shape[0] == self.num_envs * num_agents_per_env:
+                            logp = logp.reshape(self.num_envs, num_agents_per_env, -1)
+                    
+                    # terminal_v should be (num_envs, num_agents, 1)
+                    if terminal_v.ndim == 2 and terminal_v.shape[0] == self.num_envs:
+                        if terminal_v.shape[1] != num_agents_per_env:
+                            terminal_v = np.tile(terminal_v[:, np.newaxis, :], (1, num_agents_per_env, 1))
+                    elif terminal_v.ndim == 1:
+                        terminal_v = np.tile(terminal_v[:, np.newaxis, np.newaxis], (1, num_agents_per_env, 1))
+                else:
+                    # Single-agent vectorized: shapes should be (num_envs, 1)
+                    if rew.ndim == 1:
+                        rew = rew[:, np.newaxis]
+                    if mask.ndim == 1:
+                        mask = mask[:, np.newaxis]
+                    if v.ndim == 1:
+                        v = v[:, np.newaxis]
+                    elif v.ndim == 2 and v.shape[0] != self.num_envs:
+                        v = v.reshape(self.num_envs, -1)
+                    if logp.ndim == 1:
+                        logp = logp[:, np.newaxis]
+                    elif logp.ndim == 2 and logp.shape[0] != self.num_envs:
+                        logp = logp.reshape(self.num_envs, -1)
             else:
-                # Single-agent case
-                num_agents = 1
-                if rew.shape == (1,) or (rew.ndim == 1 and rew.shape[0] == 1):
-                    rew = rew.reshape(1, 1)  # Shape: (1, 1)
-                elif rew.ndim == 2 and rew.shape[0] > 1:
-                    rew = rew[:1, :]  # Take first agent's reward
-                
-                if mask.shape == (1,) or (mask.ndim == 1 and mask.shape[0] == 1):
-                    mask = mask.reshape(1, 1)  # Shape: (1, 1)
-                elif mask.ndim == 2 and mask.shape[0] > 1:
-                    mask = mask[:1, :]  # Take first agent's mask
+                # Single environment
+                is_multi_agent = len(obs.shape) > 1 and obs.shape[0] > 1
+                if is_multi_agent:
+                    num_agents_per_env = obs.shape[0]
                     
-                if v.ndim == 3 and v.shape[-1] == 1:
-                    v = v.reshape(1, 1)  # Shape: (1, 1)
-                elif v.ndim == 2 and v.shape[0] > 1:
-                    v = v[:1, :]  # Take first agent's value
+                    # Ensure rewards and masks have correct shape for multi-agent (single env)
+                    if rew.shape == (1,) or (rew.ndim == 1 and rew.shape[0] == 1):
+                        rew = np.full((num_agents_per_env, 1), rew[0])
+                    elif rew.ndim == 2 and rew.shape[0] != num_agents_per_env:
+                        rew = np.full((num_agents_per_env, 1), rew[0, 0] if rew.shape[0] > 0 else rew[0])
                     
-                if logp.ndim == 3 and logp.shape[-1] == 1:
-                    logp = logp.reshape(1, 1)  # Shape: (1, 1)
-                elif logp.ndim == 2 and logp.shape[0] > 1:
-                    logp = logp[:1, :]  # Take first agent's log probability
-                
-                # Ensure terminal_v has the right shape
-                if terminal_v.shape == () or terminal_v.size == 1:
-                    terminal_v = np.zeros((1, 1))
-                elif terminal_v.ndim == 3 and terminal_v.shape[-1] == 1:
-                    terminal_v = terminal_v.reshape(1, 1)
-                elif terminal_v.ndim == 2 and terminal_v.shape[0] > 1:
-                    terminal_v = terminal_v[:1, :]
+                    if mask.shape == (1,) or (mask.ndim == 1 and mask.shape[0] == 1):
+                        mask = np.full((num_agents_per_env, 1), mask[0])
+                    elif mask.ndim == 2 and mask.shape[0] != num_agents_per_env:
+                        mask = np.full((num_agents_per_env, 1), mask[0, 0] if mask.shape[0] > 0 else mask[0])
+                    
+                    # Ensure v and logp have correct shape
+                    if v.ndim == 3 and v.shape[-1] == 1:
+                        v = v.reshape(num_agents_per_env, 1)
+                    elif v.ndim == 2 and v.shape[0] != num_agents_per_env:
+                        v = np.full((num_agents_per_env, 1), v[0, 0] if v.shape[0] > 0 else v[0])
+                        
+                    if logp.ndim == 3 and logp.shape[-1] == 1:
+                        logp = logp.reshape(num_agents_per_env, 1)
+                    elif logp.ndim == 2 and logp.shape[0] != num_agents_per_env:
+                        logp = np.full((num_agents_per_env, 1), logp[0, 0] if logp.shape[0] > 0 else logp[0])
+                        
+                    # Ensure terminal_v has the right shape
+                    if terminal_v.shape == () or terminal_v.size == 1:
+                        terminal_v = np.zeros((num_agents_per_env, 1))
+                    elif terminal_v.ndim == 3 and terminal_v.shape[-1] == 1:
+                        terminal_v = terminal_v.reshape(num_agents_per_env, 1)
+                    elif terminal_v.ndim == 2 and terminal_v.shape[0] != num_agents_per_env:
+                        terminal_v = np.zeros((num_agents_per_env, 1))
+                else:
+                    # Single-agent single environment
+                    num_agents_per_env = 1
+                    if rew.shape == (1,) or (rew.ndim == 1 and rew.shape[0] == 1):
+                        rew = rew.reshape(1, 1)
+                    elif rew.ndim == 2 and rew.shape[0] > 1:
+                        rew = rew[:1, :]
+                    
+                    if mask.shape == (1,) or (mask.ndim == 1 and mask.shape[0] == 1):
+                        mask = mask.reshape(1, 1)
+                    elif mask.ndim == 2 and mask.shape[0] > 1:
+                        mask = mask[:1, :]
+                        
+                    if v.ndim == 3 and v.shape[-1] == 1:
+                        v = v.reshape(1, 1)
+                    elif v.ndim == 2 and v.shape[0] > 1:
+                        v = v[:1, :]
+                        
+                    if logp.ndim == 3 and logp.shape[-1] == 1:
+                        logp = logp.reshape(1, 1)
+                    elif logp.ndim == 2 and logp.shape[0] > 1:
+                        logp = logp[:1, :]
+                    
+                    # Ensure terminal_v has the right shape
+                    if terminal_v.shape == () or terminal_v.size == 1:
+                        terminal_v = np.zeros((1, 1))
+                    elif terminal_v.ndim == 3 and terminal_v.shape[-1] == 1:
+                        terminal_v = terminal_v.reshape(1, 1)
+                    elif terminal_v.ndim == 2 and terminal_v.shape[0] > 1:
+                        terminal_v = terminal_v[:1, :]
 
             # Prepare data for buffer
             buffer_data = {
@@ -586,79 +1006,156 @@ class MAPPO(BaseController):
             
             obs = next_obs
             
-            # Reset if episode done
-            if done:
-                obs, _ = self.env.reset()
-                obs = self.obs_normalizer(obs)
+            # Reset if episode done (for vectorized, reset only done envs)
+            if self.is_vectorized:
+                # Vectorized envs auto-reset done environments
+                # But we need to normalize the new observations
+                if np.any(done):
+                    # Some environments were reset, re-normalize all obs
+                    obs = self.obs_normalizer(obs)
+            else:
+                # Single environment
+                if done:
+                    obs, info = self.env.reset()
+                    obs = self.obs_normalizer(obs)
         
         self.obs = obs
-        self.total_steps += self.rollout_steps
+        # Update total steps (multiply by num_envs for vectorized)
+        steps_increment = self.rollout_steps * self.num_envs if self.is_vectorized else self.rollout_steps
+        self.total_steps += steps_increment
         
         # Get last value for returns computation
         with torch.inference_mode():
-            obs_tensor = torch.FloatTensor(obs).to(self.device)
-            
-            if self.centralized_critic:
-                # Get global observation for centralized critic
-                last_global_obs = self._get_global_observation(obs)
-                last_global_obs_tensor = torch.FloatTensor(last_global_obs).to(self.device).unsqueeze(0)
-                last_val = self.agent.ac.get_value(last_global_obs_tensor).detach().cpu().numpy()
-                
-                # Reshape to match expected format
-                if last_val.shape == (1, 1):
-                    # Single value for all agents
-                    if is_multi_agent:
-                        last_val = np.full((self.num_agents, 1), last_val[0, 0])
+            if self.is_vectorized:
+                # For vectorized envs, get last value for each environment
+                if self.centralized_critic:
+                    # Get global observation for each env
+                    if isinstance(obs, np.ndarray) and obs.ndim > 2:
+                        # Multi-agent vectorized: (num_envs, num_agents, obs_dim)
+                        last_global_obs = np.array([self._get_global_observation(obs[i]) for i in range(self.num_envs)])
                     else:
-                        last_val = last_val[0, 0]
-                elif last_val.shape[0] == 1 and last_val.shape[1] > 1:
-                    # Multiple values in batch dimension
-                    last_val = last_val[0]
-            else:
-                # Decentralized critic (IPPO-style)
-                if is_multi_agent:
-                    last_vals = []
-                    for i in range(self.num_agents):
-                        agent_obs = obs_tensor[i].unsqueeze(0) if obs_tensor.dim() > 1 else obs_tensor
-                        agent_val = self.agent.ac.get_value(agent_obs, agent_idx=i).detach().cpu().numpy()
-                        last_vals.append(agent_val)
-                    last_val = np.array(last_vals)
+                        last_global_obs = np.array([self._get_global_observation(obs[i]) for i in range(self.num_envs)])
+                    last_global_obs_tensor = torch.FloatTensor(last_global_obs).to(self.device)
+                    last_vals = self.agent.ac.get_value(last_global_obs_tensor).detach().cpu().numpy()
+                    # Shape: (num_envs, 1) or (num_envs, num_agents, 1)
+                    if is_multi_agent:
+                        # Expand to (num_envs, num_agents, 1)
+                        if last_vals.ndim == 2 and last_vals.shape[1] == 1:
+                            last_vals = np.tile(last_vals, (1, self.num_agents, 1))
+                    last_val = last_vals
                 else:
-                    last_val = self.agent.ac.get_value(obs_tensor, agent_idx=0).detach().cpu().numpy()
+                    # Decentralized critic
+                    if isinstance(obs, np.ndarray) and obs.ndim > 2:
+                        # Multi-agent: (num_envs, num_agents, obs_dim)
+                        last_vals = []
+                        for env_idx in range(self.num_envs):
+                            env_vals = []
+                            for agent_idx in range(self.num_agents):
+                                agent_obs = torch.FloatTensor(obs[env_idx, agent_idx]).to(self.device).unsqueeze(0)
+                                agent_val = self.agent.ac.get_value(agent_obs, agent_idx=agent_idx).detach().cpu().numpy()
+                                env_vals.append(agent_val)
+                            last_vals.append(np.array(env_vals))
+                        last_val = np.array(last_vals)  # (num_envs, num_agents, 1)
+                    else:
+                        # Single-agent vectorized: (num_envs, obs_dim)
+                        obs_tensor = torch.FloatTensor(obs).to(self.device)
+                        last_val = self.agent.ac.get_value(obs_tensor, agent_idx=0).detach().cpu().numpy()
+            else:
+                # Single environment
+                obs_tensor = torch.FloatTensor(obs).to(self.device)
+                
+                if self.centralized_critic:
+                    # Get global observation for centralized critic
+                    last_global_obs = self._get_global_observation(obs)
+                    last_global_obs_tensor = torch.FloatTensor(last_global_obs).to(self.device).unsqueeze(0)
+                    last_val = self.agent.ac.get_value(last_global_obs_tensor).detach().cpu().numpy()
+                    
+                    # Reshape to match expected format
+                    if last_val.shape == (1, 1):
+                        # Single value for all agents
+                        if is_multi_agent:
+                            last_val = np.full((self.num_agents, 1), last_val[0, 0])
+                        else:
+                            last_val = last_val[0, 0]
+                    elif last_val.shape[0] == 1 and last_val.shape[1] > 1:
+                        # Multiple values in batch dimension
+                        last_val = last_val[0]
+                else:
+                    # Decentralized critic (IPPO-style)
+                    if is_multi_agent:
+                        last_vals = []
+                        for i in range(self.num_agents):
+                            agent_obs = obs_tensor[i].unsqueeze(0) if obs_tensor.dim() > 1 else obs_tensor
+                            agent_val = self.agent.ac.get_value(agent_obs, agent_idx=i).detach().cpu().numpy()
+                            last_vals.append(agent_val)
+                        last_val = np.array(last_vals)
+                    else:
+                        last_val = self.agent.ac.get_value(obs_tensor, agent_idx=0).detach().cpu().numpy()
         
         # Ensure last_val has proper shape for compute_returns_and_advantages
         if isinstance(last_val, np.ndarray):
-            if last_val.ndim == 0:
-                last_val = last_val.item()
-            elif last_val.ndim == 1 and last_val.shape[0] > 1:
-                # Multi-agent: ensure shape (num_agents, 1)
-                last_val = last_val.reshape(-1, 1)
-            elif last_val.ndim == 2 and last_val.shape[1] == 1:
-                # Already correct shape
-                pass
+            if self.is_vectorized:
+                # Vectorized: last_val should be (num_envs, num_agents, 1) or (num_envs, 1)
+                if last_val.ndim == 2 and last_val.shape[1] == 1:
+                    # (num_envs, 1) - single agent
+                    if is_multi_agent:
+                        # Expand to (num_envs, num_agents, 1)
+                        last_val = np.tile(last_val[:, np.newaxis, :], (1, self.num_agents, 1))
+                elif last_val.ndim == 3:
+                    # Already (num_envs, num_agents, 1)
+                    pass
+                elif last_val.ndim == 1:
+                    # (num_envs,) - expand
+                    last_val = last_val[:, np.newaxis]
+                    if is_multi_agent:
+                        last_val = np.tile(last_val[:, np.newaxis, :], (1, self.num_agents, 1))
+            else:
+                # Single environment
+                if last_val.ndim == 0:
+                    last_val = last_val.item()
+                elif last_val.ndim == 1 and last_val.shape[0] > 1:
+                    # Multi-agent: ensure shape (num_agents, 1)
+                    last_val = last_val.reshape(-1, 1)
+                elif last_val.ndim == 2 and last_val.shape[1] == 1:
+                    # Already correct shape
+                    pass
         
-        # Compute returns and advantages
-        ret, adv = compute_returns_and_advantages(
-            rollouts.rew,
-            rollouts.v,
-            rollouts.mask,
-            rollouts.terminal_v,
+        # Compute returns and advantages using buffer's method (handles GPU tensors)
+        # Convert last_val to appropriate format if needed
+        if isinstance(last_val, torch.Tensor):
+            last_val = last_val.cpu().numpy() if not rollouts.use_gpu_storage else last_val
+        ret, adv = rollouts.compute_returns_and_advantages(
             last_val,
             gamma=self.gamma,
             use_gae=self.use_gae,
             gae_lambda=self.gae_lambda
         )
         
-        # Store computed returns and normalized advantages
-        rollouts.ret = ret
+        # Normalize advantages (handles both numpy and torch tensors)
         rollouts.adv = normalize_advantages(adv)
         
         # Update agent
         results = self.agent.update(rollouts, self.device)
         results.update({'step': self.total_steps, 'elapsed_time': time.time() - start})
         
+        # Calculate step reward statistics
+        if len(step_rewards) > 0:
+            step_rewards_array = np.array(step_rewards)
+            results['step_reward_mean'] = step_rewards_array.mean()
+            results['step_reward_std'] = step_rewards_array.std()
+            results['step_reward_total'] = step_rewards_array.sum()
+        else:
+            results['step_reward_mean'] = 0
+            results['step_reward_std'] = 0
+            results['step_reward_total'] = 0
+        
         # Update episode statistics
-        self.episode_return += np.sum(rollouts.rew) / self.rollout_steps
+        # Handle both GPU tensors and numpy arrays
+        if isinstance(rollouts.rew, torch.Tensor):
+            rew_sum = rollouts.rew.cpu().numpy().sum()
+        else:
+            rew_sum = np.sum(rollouts.rew)
+        self.episode_return += rew_sum / self.rollout_steps
         self.episode_length += self.rollout_steps
         
         return results
@@ -723,6 +1220,17 @@ class MAPPO(BaseController):
             step,
             prefix='loss')
         
+        # Step reward statistics (from current rollout)
+        if 'step_reward_mean' in results:
+            self.logger.add_scalars(
+                {
+                    'step_reward_mean': results.get('step_reward_mean', 0),
+                    'step_reward_std': results.get('step_reward_std', 0),
+                    'step_reward_total': results.get('step_reward_total', 0)
+                },
+                step,
+                prefix='reward')
+        
         # Performance stats.
         ep_lengths = np.asarray(self.env.length_queue)
         ep_returns = np.asarray(self.env.return_queue)
@@ -731,12 +1239,32 @@ class MAPPO(BaseController):
         else:
             ep_constraint_violation = np.zeros_like(ep_returns)
         
+        # Calculate reward statistics
+        if len(ep_returns) > 0:
+            mean_return = ep_returns.mean()
+            std_return = ep_returns.std()
+            total_return = ep_returns.sum()
+            # Mean reward per step (average across all episodes)
+            mean_reward_per_step = (ep_returns / ep_lengths).mean() if len(ep_lengths) > 0 and ep_lengths.mean() > 0 else 0
+            # Standard deviation of rewards per step
+            rewards_per_step = ep_returns / ep_lengths if len(ep_lengths) > 0 else np.zeros_like(ep_returns)
+            std_reward_per_step = rewards_per_step.std() if len(rewards_per_step) > 0 else 0
+        else:
+            mean_return = 0
+            std_return = 0
+            total_return = 0
+            mean_reward_per_step = 0
+            std_reward_per_step = 0
+        
         self.logger.add_scalars(
             {
-                'ep_length': ep_lengths.mean(),
-                'ep_return': ep_returns.mean(),
-                'ep_reward': (ep_returns / ep_lengths).mean() if len(ep_lengths) > 0 and ep_lengths.mean() > 0 else 0,
-                'ep_constraint_violation': ep_constraint_violation.mean()
+                'ep_length': ep_lengths.mean() if len(ep_lengths) > 0 else 0,
+                'ep_return': mean_return,
+                'ep_return_std': std_return,
+                'ep_return_total': total_return,
+                'ep_reward': mean_reward_per_step,  # Mean reward per step
+                'ep_reward_std': std_reward_per_step,  # Std dev of rewards per step
+                'ep_constraint_violation': ep_constraint_violation.mean() if len(ep_constraint_violation) > 0 else 0
             },
             step,
             prefix='stat')
@@ -753,13 +1281,31 @@ class MAPPO(BaseController):
             eval_constraint_violation = results['eval'].get('constraint_violation', np.zeros_like(eval_ep_returns))
             eval_mse = results['eval'].get('mse', np.zeros_like(eval_ep_returns))
             
+            # Calculate evaluation reward statistics
+            if len(eval_ep_returns) > 0:
+                eval_mean_return = eval_ep_returns.mean()
+                eval_std_return = eval_ep_returns.std()
+                eval_total_return = eval_ep_returns.sum()
+                eval_mean_reward_per_step = (eval_ep_returns / eval_ep_lengths).mean() if len(eval_ep_lengths) > 0 and eval_ep_lengths.mean() > 0 else 0
+                eval_rewards_per_step = eval_ep_returns / eval_ep_lengths if len(eval_ep_lengths) > 0 else np.zeros_like(eval_ep_returns)
+                eval_std_reward_per_step = eval_rewards_per_step.std() if len(eval_rewards_per_step) > 0 else 0
+            else:
+                eval_mean_return = 0
+                eval_std_return = 0
+                eval_total_return = 0
+                eval_mean_reward_per_step = 0
+                eval_std_reward_per_step = 0
+            
             self.logger.add_scalars(
                 {
-                    'ep_length': eval_ep_lengths.mean(),
-                    'ep_return': eval_ep_returns.mean(),
-                    'ep_reward': (eval_ep_returns / eval_ep_lengths).mean() if len(eval_ep_lengths) > 0 and eval_ep_lengths.mean() > 0 else 0,
-                    'constraint_violation': eval_constraint_violation.mean(),
-                    'mse': eval_mse.mean()
+                    'ep_length': eval_ep_lengths.mean() if len(eval_ep_lengths) > 0 else 0,
+                    'ep_return': eval_mean_return,
+                    'ep_return_std': eval_std_return,
+                    'ep_return_total': eval_total_return,
+                    'ep_reward': eval_mean_reward_per_step,
+                    'ep_reward_std': eval_std_reward_per_step,
+                    'constraint_violation': eval_constraint_violation.mean() if len(eval_constraint_violation) > 0 else 0,
+                    'mse': eval_mse.mean() if len(eval_mse) > 0 else 0
                 },
                 step,
                 prefix='stat_eval')

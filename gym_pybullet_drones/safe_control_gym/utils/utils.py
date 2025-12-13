@@ -92,7 +92,22 @@ def set_random_state(state_dict):
     '''Resets the random state for experiment restore.'''
     random.setstate(state_dict['random'])
     np.random.set_state(state_dict['numpy'])
-    torch.torch.set_rng_state(state_dict['torch'])
+    # Handle torch RNG state with error checking
+    if 'torch' in state_dict:
+        torch_state = state_dict['torch']
+        try:
+            # Ensure it's a ByteTensor
+            if isinstance(torch_state, torch.Tensor):
+                if not isinstance(torch_state, torch.ByteTensor):
+                    torch_state = torch_state.byte()
+                torch.set_rng_state(torch_state)
+            else:
+                # If it's not a tensor, try to convert
+                torch.set_rng_state(torch.ByteTensor(torch_state))
+        except (TypeError, ValueError, RuntimeError) as e:
+            # If torch RNG state restoration fails, skip it
+            print(f"⚠ Warning: Could not restore torch RNG state: {e}")
+            print("   Continuing without torch RNG state restoration...")
 
 
 def set_seed(seed, cuda=False):

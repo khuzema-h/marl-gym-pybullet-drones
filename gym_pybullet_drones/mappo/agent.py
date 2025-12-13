@@ -354,37 +354,65 @@ class MAPPOActorCritic(nn.Module):
             obs = torch.FloatTensor(obs).to(next(self.parameters()).device)
         
         # Handle multi-agent observations
-        if len(obs.shape) == 2 and obs.shape[0] > 1:
-            # Multi-agent: (num_agents, obs_dim)
-            num_agents, obs_dim = obs.shape
-            actions = []
-            logps = []
-            
-            # Each agent acts based on its local observation (decentralized execution)
-            for i in range(num_agents):
-                actor = self.get_actor(i)
-                drone_obs = obs[i].unsqueeze(0)  # (1, obs_dim)
-                dist, _ = actor(drone_obs)
-                action = dist.sample()  # (1, act_dim)
+        if len(obs.shape) == 2:
+            if obs.shape[0] > 1 and obs.shape[0] <= self.num_agents:
+                # Multi-agent single step: (num_agents, obs_dim) - process sequentially
+                num_agents, obs_dim = obs.shape
+                actions = []
+                logps = []
+                
+                # Each agent acts based on its local observation (decentralized execution)
+                for i in range(num_agents):
+                    actor = self.get_actor(i)
+                    drone_obs = obs[i].unsqueeze(0)  # (1, obs_dim)
+                    dist, _ = actor(drone_obs)
+                    action = dist.sample()  # (1, act_dim)
 
-                # Apply action scaling
+                    # Apply action scaling
+                    if hasattr(actor, 'action_scale') and actor.action_scale != 1.0:
+                        action = action * actor.action_scale
+
+                    logp = dist.log_prob(action)  # (1,)
+                    
+                    actions.append(action.squeeze(0))
+                    logps.append(logp.squeeze(0))
+                
+                # Stack actions and log probabilities
+                action = torch.stack(actions)  # (num_agents, act_dim)
+                logp = torch.stack(logps).unsqueeze(-1)  # (num_agents, 1)
+                
+                # In true CTDE, critic is not used during execution
+                # But we might need placeholder values for compatibility
+                v = torch.zeros(num_agents, 1, device=obs.device)
+                
+                return action.cpu().numpy(), v.cpu().numpy(), logp.cpu().numpy()
+            elif obs.shape[0] > self.num_agents:
+                # Batched multi-agent: (num_envs * num_agents, obs_dim) - process in batch
+                batch_size = obs.shape[0]
+                num_agents_per_batch = self.num_agents
+                num_envs = batch_size // num_agents_per_batch
+                
+                # Get the actor (assuming shared weights or first agent's actor)
+                actor = self.get_actor(0)
+                
+                # Process all observations in a single batched forward pass
+                dist, _ = actor(obs)  # (batch_size, act_dim)
+                action = dist.sample()  # (batch_size, act_dim)
+                
+                # Apply action scaling if needed
                 if hasattr(actor, 'action_scale') and actor.action_scale != 1.0:
                     action = action * actor.action_scale
-
-                logp = dist.log_prob(action)  # (1,)
                 
-                actions.append(action.squeeze(0))
-                logps.append(logp.squeeze(0))
-            
-            # Stack actions and log probabilities
-            action = torch.stack(actions)  # (num_agents, act_dim)
-            logp = torch.stack(logps).unsqueeze(-1)  # (num_agents, 1)
-            
-            # In true CTDE, critic is not used during execution
-            # But we might need placeholder values for compatibility
-            v = torch.zeros(num_agents, 1, device=obs.device)
-            
-            return action.cpu().numpy(), v.cpu().numpy(), logp.cpu().numpy()
+                logp = dist.log_prob(action)  # (batch_size,)
+                
+                # Reshape to maintain structure: (num_envs, num_agents, act_dim)
+                action = action.reshape(num_envs, num_agents_per_batch, -1)
+                logp = logp.reshape(num_envs, num_agents_per_batch, 1)
+                
+                # Placeholder values for critic
+                v = torch.zeros(num_envs, num_agents_per_batch, 1, device=obs.device)
+                
+                return action.cpu().numpy(), v.cpu().numpy(), logp.cpu().numpy()
         else:
             # Single agent
             actor = self.get_actor(0)
