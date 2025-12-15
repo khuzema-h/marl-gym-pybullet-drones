@@ -57,7 +57,7 @@ DEFAULT_OUTPUT_FOLDER = 'results'
 DEFAULT_COLAB = False
 
 DEFAULT_OBS = ObservationType('kin')  # 'kin' or 'rgb'
-DEFAULT_ACT = ActionType('one_d_rpm')  # 'rpm' or 'pid' or 'vel' or 'one_d_rpm' or 'one_d_pid'
+DEFAULT_ACT = ActionType('one_d_pid')  # 'rpm' or 'pid' or 'vel' or 'one_d_rpm' or 'one_d_pid'
 DEFAULT_AGENTS = 5  # Start with 2 agents for easier training
 DEFAULT_MA = True  # Default to multi-agent for MAPPO
 
@@ -195,7 +195,7 @@ def run(multiagent=DEFAULT_MA,
         'hidden_dim': 256,
         'actor_lr': 0.0003,
         'critic_lr': 0.001,
-        'rollout_steps': 64,  # Reduced for testing
+        'rollout_steps': 256,  # Reduced for testing
         'rollout_batch_size': rollout_batch_size,  # Number of parallel environments
         'num_workers': num_workers,  # Number of parallel processes for vectorized envs
         'opt_epochs': 10,  # Reduced for testing
@@ -205,14 +205,14 @@ def run(multiagent=DEFAULT_MA,
         'gamma': 0.99,
         'clip_param': 0.1,
         'target_kl': 0.01,
-        'entropy_coef': 0.0005,
+        'entropy_coef': 0.005,
         'use_clipped_value': False,
         # Normalization
         'norm_obs': True,
         'norm_reward': False,
         'clip_obs': 10,
         'clip_reward': 10,
-        'action_scale': 0.4,
+        'action_scale': 0.25,
     })
 
     # Log configuration to WandB

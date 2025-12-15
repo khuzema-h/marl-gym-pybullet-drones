@@ -96,24 +96,56 @@ class MultiHoverAviary(BaseRLAviary):
             pos = states[i, 0:3]
             vel = states[i, 3:6]
 
-            # Position error
-            pos_error = self.TARGET_POS[i] - pos
-            dist_xy = np.linalg.norm(pos_error[0:2])
-            dist_z = pos_error[2]
+            target = self.TARGET_POS[i]
 
-            # Velocity penalty (especially vertical)
-            vel_z = vel[2]
+            # --------------------
+            # Errors
+            # --------------------
+            err_xy = np.linalg.norm(pos[0:2] - target[0:2])
+            err_z  = pos[2] - target[2]
+            vel_z  = vel[2]
 
-            # === Reward components ===
-            r_pos = np.exp(-2.0 * dist_xy)            # stay near XY
-            r_height = np.exp(-4.0 * abs(dist_z))    # strong height control
-            r_vel = -0.1 * vel_z**2                   # kill vertical speed
+            # --------------------
+            # Position shaping
+            # --------------------
+            r_xy = np.exp(-2.0 * err_xy)
+            r_z  = np.exp(-4.0 * abs(err_z))
 
-            reward += r_pos + r_height + r_vel
+            # --------------------
+            # Velocity damping (CRITICAL)
+            # --------------------
+            r_vel = -1.5 * vel_z**2
 
-        # Normalize
+            # --------------------
+            # Soft overshoot penalty (asymmetric)
+            # --------------------
+            height_penalty = 0.0
+            if err_z > 0.0:
+                height_penalty = -2.0 * err_z**2
+
+            # --------------------
+            # Hover bonus (tight window)
+            # --------------------
+            hover_bonus = 0.0
+            if err_xy < 0.03 and abs(err_z) < 0.03 and abs(vel_z) < 0.03:
+                hover_bonus = 0.5
+
+            reward += (
+                r_xy +
+                r_z +
+                r_vel +
+                height_penalty +
+                hover_bonus
+            )
+
+        # --------------------
+        # Normalize across agents (IMPORTANT for MAPPO)
+        # --------------------
         reward /= self.NUM_DRONES
-        return reward
+
+        return float(reward)
+
+
 
 
 
@@ -139,25 +171,27 @@ class MultiHoverAviary(BaseRLAviary):
     #     else:
     #         return False
     def _computeTerminated(self):
-        states = np.array([self._getDroneStateVector(i) for i in range(self.NUM_DRONES)])
+        terminated = False
 
         for i in range(self.NUM_DRONES):
-            x, y, z = states[i, 0], states[i, 1], states[i, 2]
-            roll, pitch = states[i, 7], states[i, 8]
+            state = self._getDroneStateVector(i)
+            x, y, z = state[0], state[1], state[2]
+            roll, pitch = state[7], state[8]
 
-            # Crash on ground
-            if z < 0.05:
-                return True
-            
-            # Excessive tilt → out of control
-            if abs(roll) > 0.8 or abs(pitch) > 0.8:
-                return True
+            # 💥 Crash into ground
+            if z < 0.03:
+                terminated = True
 
-            # Escaped boundary
-            if abs(x) > 3.0 or abs(y) > 3.0 or z > 3.0:
-                return True
+            # 💥 Completely flipped (hard failure)
+            if abs(roll) > 1.2 or abs(pitch) > 1.2:
+                terminated = True
 
-        return False
+            # 💥 Escaped XY boundary (safety)
+            if abs(x) > 3.0 or abs(y) > 3.0:
+                terminated = True
+
+        return terminated
+
 
 
 
@@ -183,11 +217,7 @@ class MultiHoverAviary(BaseRLAviary):
     #     else:
     #         return False
     def _computeTruncated(self):
-        # Only truncate after episode time runs out
-        if self.step_counter / self.PYB_FREQ > self.EPISODE_LEN_SEC:
-            return True
-        return False
-
+        return self.step_counter / self.PYB_FREQ > self.EPISODE_LEN_SEC
 
 
 

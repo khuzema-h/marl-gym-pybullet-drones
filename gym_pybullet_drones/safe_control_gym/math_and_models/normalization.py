@@ -155,7 +155,8 @@ class RewardStdNormalizer(MeanStdNormalizer):
             self.ret = self.ret * self.gamma + x
             self.rms.update(self.ret)
             # Prevent information leak from previous episodes.
-            self.ret[dones.astype(np.long)] = 0
+            # self.ret[dones.astype(np.long)] = 0
+            self.ret[dones.astype(np.int64)] = 0
         return np.clip(x / np.sqrt(self.rms.var + self.epsilon), -self.clip, self.clip)
 
 

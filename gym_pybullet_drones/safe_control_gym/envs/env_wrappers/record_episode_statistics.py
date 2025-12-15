@@ -144,7 +144,8 @@ class VecRecordEpisodeStatistics(VecEnvWrapper):
     def step_wait(self):
         obs, reward, done, info = self.venv.step_wait()
         for i, (r, d) in enumerate(zip(reward, done)):
-            self.episode_return[i] += r
+            # self.episode_return[i] += r
+            self.episode_return[i] += float(np.mean(r))
             self.episode_length[i] += 1
             # Add other tracked stats.
             for key in self.episode_stats:
