@@ -95,37 +95,39 @@ class MultiHoverAviary(BaseRLAviary):
         for i in range(self.NUM_DRONES):
             pos = states[i, 0:3]
             vel = states[i, 3:6]
-
             target = self.TARGET_POS[i]
 
-            # --------------------
+            # ------------------------
             # Errors
-            # --------------------
+            # ------------------------
             err_xy = np.linalg.norm(pos[0:2] - target[0:2])
             err_z  = pos[2] - target[2]
             vel_z  = vel[2]
 
-            # --------------------
+            # ------------------------
             # Position shaping
-            # --------------------
+            # ------------------------
             r_xy = np.exp(-2.0 * err_xy)
-            r_z  = np.exp(-4.0 * abs(err_z))
+            r_z  = np.exp(-2.5 * abs(err_z))   # Stronger ascent gradient
 
-            # --------------------
-            # Velocity damping (CRITICAL)
-            # --------------------
-            r_vel = -1.5 * vel_z**2
+            # ------------------------
+            # Velocity damping (ONLY near target)
+            # ------------------------
+            if abs(err_z) < 0.2:
+                r_vel = -1.5 * vel_z**2
+            else:
+                r_vel = 0.0
 
-            # --------------------
+            # ------------------------
             # Soft overshoot penalty (asymmetric)
-            # --------------------
+            # ------------------------
             height_penalty = 0.0
             if err_z > 0.0:
-                height_penalty = -2.0 * err_z**2
+                height_penalty = -1.0 * err_z**2
 
-            # --------------------
-            # Hover bonus (tight window)
-            # --------------------
+            # ------------------------
+            # Hover bonus (tight attractor)
+            # ------------------------
             hover_bonus = 0.0
             if err_xy < 0.03 and abs(err_z) < 0.03 and abs(vel_z) < 0.03:
                 hover_bonus = 0.5
@@ -138,12 +140,13 @@ class MultiHoverAviary(BaseRLAviary):
                 hover_bonus
             )
 
-        # --------------------
-        # Normalize across agents (IMPORTANT for MAPPO)
-        # --------------------
+        # ------------------------
+        # MAPPO-correct normalization
+        # ------------------------
         reward /= self.NUM_DRONES
 
         return float(reward)
+
 
 
 
