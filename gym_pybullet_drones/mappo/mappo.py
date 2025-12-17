@@ -2,6 +2,7 @@
 
 import os
 import time
+from collections import defaultdict
 import numpy as np
 import torch
 
@@ -640,6 +641,7 @@ class MAPPO(BaseController):
         
         # Track step rewards for statistics
         step_rewards = []
+        termination_counts = defaultdict(int)
         
         # Collect rollouts
         for step in range(self.rollout_steps):
@@ -713,6 +715,26 @@ class MAPPO(BaseController):
                 done = terminated or truncated
             else:
                 next_obs, rew, done, info = step_result
+
+            # Parse termination reasons
+            infos_to_check = []
+            if self.is_vectorized:
+                if isinstance(info, dict) and 'n' in info:
+                    infos_to_check = info['n']
+            else:
+                infos_to_check = [info]
+                
+            for inf in infos_to_check:
+                if 'termination_reasons' in inf:
+                    for reason in inf['termination_reasons']:
+                        if "crashed" in reason:
+                            termination_counts['crash'] += 1
+                        elif "flipped" in reason:
+                            termination_counts['flip'] += 1
+                        elif "out of bounds" in reason:
+                            termination_counts['out_of_bounds'] += 1
+
+
 
             # Handle vectorized environment outputs
             if self.is_vectorized:
@@ -1158,6 +1180,7 @@ class MAPPO(BaseController):
         self.episode_return += rew_sum / self.rollout_steps
         self.episode_length += self.rollout_steps
         
+        results['termination_counts'] = termination_counts
         return results
 
     def log_step(self, results):
@@ -1273,6 +1296,19 @@ class MAPPO(BaseController):
         if 'constraint_violation' in self.env.accumulated_stats:
             total_violations = self.env.accumulated_stats['constraint_violation']
             self.logger.add_scalars({'constraint_violation': total_violations}, step, prefix='stat')
+        
+        # Total constraint violation during learning.
+        if 'constraint_violation' in self.env.accumulated_stats:
+            total_violations = self.env.accumulated_stats['constraint_violation']
+            self.logger.add_scalars({'constraint_violation': total_violations}, step, prefix='stat')
+            
+        # Log termination counts
+        if 'termination_counts' in results and results['termination_counts']:
+            self.logger.add_scalars(
+                results['termination_counts'],
+                step,
+                prefix='termination'
+            )
         
         if 'eval' in results:
             eval_ep_lengths = results['eval']['ep_lengths']

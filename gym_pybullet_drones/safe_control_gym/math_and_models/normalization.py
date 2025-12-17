@@ -150,13 +150,13 @@ class RewardStdNormalizer(MeanStdNormalizer):
         x = np.asarray(x)
         if not self.read_only:
             # Track running average of forward discounted returns.
+            # Track running average of forward discounted returns.
             if self.ret is None:
-                self.ret = np.zeros(x.shape[0])
+                self.ret = np.zeros_like(x)
             self.ret = self.ret * self.gamma + x
             self.rms.update(self.ret)
             # Prevent information leak from previous episodes.
-            # self.ret[dones.astype(np.long)] = 0
-            self.ret[dones.astype(np.int64)] = 0
+            self.ret[dones.astype(bool)] = 0
         return np.clip(x / np.sqrt(self.rms.var + self.epsilon), -self.clip, self.clip)
 
 

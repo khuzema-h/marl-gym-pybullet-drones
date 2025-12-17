@@ -101,6 +101,7 @@ def run(multiagent=DEFAULT_MA,
         wandb_project=DEFAULT_WANDB_PROJECT,
         wandb_entity=DEFAULT_WANDB_ENTITY,
         rollout_batch_size=128,
+        rollout_steps=256,
         num_workers=4,
         use_gpu=True,
         num_drones=None):
@@ -195,7 +196,7 @@ def run(multiagent=DEFAULT_MA,
         'hidden_dim': 256,
         'actor_lr': 0.0003,
         'critic_lr': 0.001,
-        'rollout_steps': 256,  # Reduced for testing
+        'rollout_steps': rollout_steps,  # Reduced for testing
         'rollout_batch_size': rollout_batch_size,  # Number of parallel environments
         'num_workers': num_workers,  # Number of parallel processes for vectorized envs
         'opt_epochs': 10,  # Reduced for testing
@@ -203,15 +204,15 @@ def run(multiagent=DEFAULT_MA,
         'use_gae': True,
         'gae_lambda': 0.95,
         'gamma': 0.99,
-        'clip_param': 0.1,
+        'clip_param': 0.2,
         'target_kl': 0.01,
         'entropy_coef': 0.005,
         'use_clipped_value': False,
         # Normalization
-        'norm_obs': True,
+        'norm_obs': False,
         'norm_reward': False,
-        'clip_obs': 10,
-        'clip_reward': 10,
+        'clip_obs': 100,
+        'clip_reward': 100,
         'action_scale': 0.25,
     })
 
@@ -661,7 +662,8 @@ if __name__ == '__main__':
     parser.add_argument('--rollout_batch_size', default=8,                     type=int,           help='Number of parallel environments for vectorized training (default: 8)', metavar='')
     parser.add_argument('--num_workers',        default=4,                     type=int,           help='Number of parallel processes for vectorized environments (default: 4)', metavar='')
     parser.add_argument('--use_gpu',            default=True,                  type=str2bool,      help='Use GPU if available (default: True)', metavar='')
-    
+    parser.add_argument('--rollout_steps',      default=256,                    type=int,           help='Number of steps per rollout (default: 64)', metavar='')
+
     ARGS = parser.parse_args()
     
     # Update DEFAULT_AGENTS if specified

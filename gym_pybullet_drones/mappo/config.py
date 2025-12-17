@@ -12,6 +12,7 @@ MAPPO_CONFIG = {
     # MAPPO-specific args
     'share_actor_weights': True,  # Share actor parameters across homogeneous agents
     'centralized_critic': True,   # Use centralized critic
+    'include_actions_in_critic': False, # Include actions in critic input
     'global_state_dim': None,     # Dimension of global state (if None, use concatenated obs)
     
     # Loss args

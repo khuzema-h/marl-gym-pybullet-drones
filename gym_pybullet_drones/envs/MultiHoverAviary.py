@@ -72,6 +72,43 @@ class MultiHoverAviary(BaseRLAviary):
         self.TARGET_POS = self.INIT_XYZS + np.array([[0,0,1/(i+1)] for i in range(num_drones)])
         # + np.array([[0,0,1/(i+1)] for i in range(num_drones)])
 
+    def reset(self, seed : int = None, options : dict = None):
+        #  Add a small random noise to the initial positions and call the parent reset method
+        # First check if the original initial position has been saved
+        if not hasattr(self, 'ORIGINAL_INIT_XYZS'):
+            self.ORIGINAL_INIT_XYZS = self.INIT_XYZS.copy()
+
+        # Create a new array of initial positions with random noise
+        # Add +/- 0.25 to the original x and y positions, and +/- 0.1 to the z position 
+        new_init_xyzs = self.ORIGINAL_INIT_XYZS.copy() + np.random.uniform(-0.25, 0.25, (self.NUM_DRONES, 3))
+        new_init_xyzs[:, 2] = np.clip(new_init_xyzs[:, 2], 0.1, 1.0)
+
+        # Make sure the drones are not too close to each other (collision) AND not too low
+        # We loop until both conditions are satisfied
+        valid_config = False
+        while not valid_config:
+            # Check collisions
+            dists = np.linalg.norm(new_init_xyzs[:, np.newaxis, :] - new_init_xyzs[np.newaxis, :, :], axis=2)
+            np.fill_diagonal(dists, np.inf) # Ignore self-collision
+            collision = np.any(dists < 0.5)
+            # Check too low
+            too_low = np.any(new_init_xyzs[:, 2] < 0.1)
+            
+            if not collision and not too_low:
+                valid_config = True
+            else:
+                # Regenerate if invalid
+                new_init_xyzs = self.ORIGINAL_INIT_XYZS.copy() + np.random.uniform(-0.25, 0.25, (self.NUM_DRONES, 3))
+                new_init_xyzs[:, 2] = np.clip(new_init_xyzs[:, 2], 0.1, 1.0)
+
+        # Update the initial positions and target positions 
+        self.INIT_XYZS = new_init_xyzs
+        self.TARGET_POS = self.INIT_XYZS + np.array([[0,0,1/(i+1)] for i in range(self.NUM_DRONES)])
+
+        # Initialize termination reason
+        self.termination_reasons = []
+        return super().reset(seed=seed, options=options)
+
     ################################################################################
     
     # def _computeReward(self):
@@ -94,7 +131,7 @@ class MultiHoverAviary(BaseRLAviary):
 
         for i in range(self.NUM_DRONES):
             pos = states[i, 0:3]
-            vel = states[i, 3:6]
+            vel = states[i, 10:13]
             target = self.TARGET_POS[i]
 
             # ------------------------
@@ -107,8 +144,9 @@ class MultiHoverAviary(BaseRLAviary):
             # ------------------------
             # Position shaping
             # ------------------------
-            r_xy = np.exp(-2.0 * err_xy)
-            r_z  = np.exp(-2.5 * abs(err_z))   # Stronger ascent gradient
+            # r_xy = np.exp(-2.0 * err_xy)
+            r_xy = 1.0 / (1 + err_xy)
+            r_z  = np.exp(-7.5 * abs(err_z))   # Stronger ascent gradient
 
             # ------------------------
             # Velocity damping (ONLY near target)
@@ -136,7 +174,7 @@ class MultiHoverAviary(BaseRLAviary):
                 r_xy +
                 r_z +
                 r_vel +
-                height_penalty +
+                # height_penalty +
                 hover_bonus
             )
 
@@ -173,8 +211,11 @@ class MultiHoverAviary(BaseRLAviary):
     #         return True
     #     else:
     #         return False
+        # return terminated
+    
     def _computeTerminated(self):
         terminated = False
+        reasons = []
 
         for i in range(self.NUM_DRONES):
             state = self._getDroneStateVector(i)
@@ -184,15 +225,19 @@ class MultiHoverAviary(BaseRLAviary):
             # 💥 Crash into ground
             if z < 0.03:
                 terminated = True
+                reasons.append(f"Drone {i} crashed (z={z:.2f})")
 
             # 💥 Completely flipped (hard failure)
             if abs(roll) > 1.2 or abs(pitch) > 1.2:
                 terminated = True
+                reasons.append(f"Drone {i} flipped (roll={roll:.2f}, pitch={pitch:.2f})")
 
             # 💥 Escaped XY boundary (safety)
             if abs(x) > 3.0 or abs(y) > 3.0:
                 terminated = True
+                reasons.append(f"Drone {i} out of bounds (pos=[{x:.2f}, {y:.2f}, {z:.2f}])")
 
+        self.termination_reasons = reasons
         return terminated
 
 
@@ -237,4 +282,4 @@ class MultiHoverAviary(BaseRLAviary):
             Dummy value.
 
         """
-        return {"answer": 42} #### Calculated by the Deep Thought supercomputer in 7.5M years
+        return {"answer": 42, "termination_reasons": self.termination_reasons} #### Calculated by the Deep Thought supercomputer in 7.5M years
