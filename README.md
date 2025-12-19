@@ -3,6 +3,8 @@
 
 This repository is a research-oriented extension of the original `gym-pybullet-drones` framework. It adds centralized-critic MAPPO training, reward shaping for stable hover, and scalable multi-drone experiments using Gymnasium-compatible environments.
 
+Videos of Hover and Spiral Task can be found here: [Google Drive](https://drive.google.com/drive/folders/1abeYI5ydfZJFkooMt4rzpf45HeVV7O4R?usp=sharing)
+
 <!-- <img src="gym_pybullet_drones/assets/multi_hover.png" alt="control info" width="325"> -->
 <img src="gym_pybullet_drones/assets/multi_hover.png" alt="control info" width="325" style="display: block; margin: 0 auto;">
 
