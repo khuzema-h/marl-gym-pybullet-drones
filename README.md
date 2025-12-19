@@ -1,12 +1,19 @@
 # marl-gym-pybullet-drones
-### Multi-agent reinforcement learning environments for quadrotor control in PyBullet, extended with a custom MAPPO implementation and stabilized multi-drone hover training.
+### Multi-agent reinforcement learning environments for quadrotor control in PyBullet
 
 This repository is a research-oriented extension of the original `gym-pybullet-drones` framework. It adds centralized-critic MAPPO training, reward shaping for stable hover, and scalable multi-drone experiments using Gymnasium-compatible environments.
 
 <!-- <img src="gym_pybullet_drones/assets/multi_hover.png" alt="control info" width="325"> -->
 <img src="gym_pybullet_drones/assets/multi_hover.png" alt="control info" width="325" style="display: block; margin: 0 auto;">
 
-<!-- <img src="gym_pybullet_drones/assets/helix.gif" alt="formation flight" width="325"> <img src="gym_pybullet_drones/assets/helix.png" alt="control info" width="425"> -->
+## Supported environments
+
+The training script supports multiple cooperative multi-drone tasks:
+
+- **MultiHover**: Independent drones stabilize at a target height
+- **Spiral**: Coordinated spiral ascent/descent trajectories
+
+Environment selection is handled via the `--env_type` flag.
 
 ## Installation
 
@@ -16,7 +23,7 @@ Tested on Ubuntu 22.04.
 git clone https://github.com/khuzema-h/marl-gym-pybullet-drones.git
 cd gym-pybullet-drones/
 
-conda create -n drones python=3.10
+conda env create -f environment.yml
 conda activate drones
 ```
 
@@ -29,6 +36,8 @@ cd gym_pybullet_drones/examples/
 # Runs multi-agent MAPPO training with 176 parallel environments using 22 worker processes for faster rollout collection
 python learn_mappo.py --multiagent true --rollout_batch_size 176 --num workers 22 
 ```
+
+### To select any task
 
 ```sh
 python env_select_learn_mappo.py --env_type spiral --gui True --record_video True  --num_drones 5 --num_workers 16 --rollout_batch_size 64
