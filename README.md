@@ -30,6 +30,10 @@ cd gym_pybullet_drones/examples/
 python learn_mappo.py --multiagent true --rollout_batch_size 176 --num workers 22 
 ```
 
+```sh
+python env_select_learn_mappo.py --env_type spiral --gui True --record_video True  --num_drones 5 --num_workers 16 --rollout_batch_size 64
+```
+
 <!-- ### PID control examples
 
 ```sh
