@@ -29,6 +29,8 @@ from gym_pybullet_drones.envs.HoverAviary import HoverAviary
 from gym_pybullet_drones.envs.MultiHoverAviary import MultiHoverAviary
 from gym_pybullet_drones.envs.FlockAviary import FlockAviary  # Added FlockAviary import
 from gym_pybullet_drones.envs.MeetupAviary import MeetupAviary  # Added MeetupAviary import
+from gym_pybullet_drones.envs.SpiralAviary import SpiralFormationAviary  # Added SpiralAviary import
+from gym_pybullet_drones.envs.LeaderFollowerAviary import LeaderFollowerAviary
 from gym_pybullet_drones.utils.utils import sync, str2bool
 from gym_pybullet_drones.utils.enums import ObservationType, ActionType
 
@@ -59,7 +61,7 @@ DEFAULT_OUTPUT_FOLDER = 'results'
 DEFAULT_COLAB = False
 
 DEFAULT_OBS = ObservationType('kin')  # 'kin' or 'rgb'
-DEFAULT_ACT = ActionType('one_d_rpm')  # 'rpm' or 'pid' or 'vel' or 'one_d_rpm' or 'one_d_pid'
+DEFAULT_ACT = ActionType('vel')  # 'rpm' or 'pid' or 'vel' or 'one_d_rpm' or 'one_d_pid'
 DEFAULT_AGENTS = 3  # Start with 3 agents for easier training
 DEFAULT_MA = True  # Default to multi-agent for MAPPO
 DEFAULT_ENV_TYPE = 'multihover'  # New: default environment type
@@ -94,6 +96,24 @@ def create_env(env_type='multihover', multiagent=False, gui=False, record_video=
                 record=record_video
             )
             print(f"✓ Created MeetupAviary with {num_drones} drones (paired agents)")
+        elif env_type.lower() == 'spiral':
+            env = SpiralFormationAviary(
+                gui=gui,
+                num_drones=num_drones,
+                obs=DEFAULT_OBS,
+                act=DEFAULT_ACT,
+                record=record_video
+            )
+            print(f"✓ Created SpiralFormationAviary with {num_drones} drones")
+        elif env_type.lower() == 'leaderfollower':
+            env = LeaderFollowerAviary(
+                gui=gui,
+                num_drones=num_drones,
+                obs=DEFAULT_OBS,
+                act=DEFAULT_ACT,
+                record=record_video
+            )
+            print(f"✓ Created LeaderFollowerAviary with {num_drones} drones")
         else:  # default to multihover
             env = MultiHoverAviary(
                 gui=gui,
@@ -135,7 +155,7 @@ def run(env_type=DEFAULT_ENV_TYPE,  # New parameter
         num_drones=None):
 
     # Validate environment type
-    valid_env_types = ['multihover', 'flock', 'meetup']
+    valid_env_types = ['multihover', 'flock', 'meetup', 'spiral','leaderfollower']
     if env_type.lower() not in valid_env_types:
         print(f"⚠ Warning: Unknown environment type '{env_type}', defaulting to 'multihover'")
         print(f"  Valid options: {valid_env_types}")
@@ -226,7 +246,7 @@ def run(env_type=DEFAULT_ENV_TYPE,  # New parameter
     mappo_config.update({
         'output_dir': filename,
         'checkpoint_path': os.path.join(filename, 'model_latest.pt'),
-        'max_env_steps': int(3e6) if local else int(1e4),  # Reduced for testing
+        'max_env_steps': int(5e6) if local else int(1e4),  # Reduced for testing
         'eval_interval': 5000,
         'eval_batch_size': 3,
         'log_interval': 1,
@@ -752,7 +772,7 @@ if __name__ == '__main__':
     ARGS = parser.parse_args()
     
     # Validate environment type
-    valid_env_types = ['multihover', 'flock', 'meetup']
+    valid_env_types = ['multihover', 'flock', 'meetup','spiral','leaderfollower']
     if ARGS.env_type.lower() not in valid_env_types:
         print(f"⚠ Warning: Unknown environment type '{ARGS.env_type}', defaulting to 'multihover'")
         print(f"  Valid options: {valid_env_types}")
